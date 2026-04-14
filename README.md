@@ -1,0 +1,617 @@
+# :shield: LD2450 Security :radar:
+
+[![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange?logo=platformio)](https://platformio.org/)
+[![ESP32](https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue?logo=espressif)](https://www.espressif.com/)
+[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+[![Version](https://img.shields.io/badge/Version-5.5.3-blue)]()
+
+**Multi-target intrusion detection system** built on ESP32 + HLK-LD2450 24 GHz mmWave radar. Real-time 2D target tracking with Kalman filtering, polygon detection zones, ghost suppression via AI noise learning, full alarm state machine, Home Assistant integration, Telegram bot, and a dark-mode web dashboard with live radar map. No cloud required.
+
+> [!TIP]
+> **New in v5.5** -- Extended Kalman Filter tracking, blackout zone drawing on the radar map, and reliability improvements ported from the LD2412 security audit.
+
+---
+
+## Table of Contents
+
+- [In 3 Points](#in-3-points)
+- [Who Is This For](#who-is-this-for)
+- [What You Need](#what-you-need)
+- [Quick Start](#quick-start) (~10 min)
+- [How It Works](#how-it-works)
+- [Features](#features)
+- [System Architecture](#system-architecture)
+- [Web Dashboard](#web-dashboard)
+- [Telegram Bot](#telegram-bot)
+- [API Reference](#api-reference)
+- [How to Update / Downgrade Sensor Firmware](#how-to-update--downgrade-sensor-firmware)
+- [Known Issues & Limitations](#known-issues--limitations)
+- [Roadmap](#roadmap)
+- [FAQ](#faq)
+- [Testing](#testing)
+- [Real-World Deployment](#real-world-deployment)
+- [Security & Privacy](#security--privacy)
+- [Development History](#development-history)
+- [Acknowledgments](#acknowledgments)
+- [License](#license)
+- [Contributing](#contributing)
+
+---
+
+## In 3 Points
+
+1. **2D multi-target tracking, not just presence.** The LD2450 reports X/Y coordinates and speed for up to 3 simultaneous targets. This firmware turns that into a security system with polygon zones, approach trails, and a live radar map.
+2. **AI ghost suppression.** mmWave radars see reflections from furniture, HVAC, and metal surfaces. A noise learning mode builds an 80x80 grid map of static reflectors and filters them out automatically.
+3. **Battle-tested architecture.** Shares the alarm state machine, MQTT offline resilience, and security hardening from the [LD2412-security](https://github.com/PeterkoCZ91/HLK-LD2412-security) project. Running in production since 2025.
+
+---
+
+## Who Is This For
+
+- **DIY security enthusiasts** who want multi-target tracking without cloud subscriptions
+- **Home Assistant users** looking for a radar node with 2D coordinates, not just a binary presence sensor
+- **LD2450 developers** who want a production-tested reference with Kalman filtering, ghost detection, and zone management
+- **Multi-sensor builders** who want to pair this with [LD2412-security](https://github.com/PeterkoCZ91/HLK-LD2412-security) for layered detection
+
+---
+
+## What You Need
+
+### Hardware
+
+| Part | Description | ~Cost |
+|------|-------------|-------|
+| ESP32 DevKit | ESP32-WROOM-32 module | $3--6 |
+| HLK-LD2450 | 24 GHz FMCW mmWave radar (UART, multi-target) | $5--8 |
+| 5 V power supply | Stable supply for both ESP32 and radar | $2--3 |
+| **Total** | | **~$12** |
+
+Optional: piezo buzzer or relay for siren output (any GPIO).
+
+### Software (All Free)
+
+- [PlatformIO](https://platformio.org/) (VS Code extension or CLI)
+- [Home Assistant](https://www.home-assistant.io/) (optional, for MQTT integration)
+- [Telegram](https://telegram.org/) (optional, for mobile alerts)
+
+### Required Skills
+
+- Basic soldering (4 wires: VCC, GND, TX, RX)
+- Editing a config file (WiFi password, MQTT server)
+- Flashing an ESP32 via USB
+
+---
+
+## Quick Start
+
+**~10 minutes from clone to working system.**
+
+```bash
+# 1. Clone
+git clone https://github.com/PeterkoCZ91/HLK-LD2450-security.git
+cd HLK-LD2450-security
+
+# 2. Create your config files
+cp include/secrets_example.h include/secrets.h
+cp include/ld2450/known_devices.h.example include/ld2450/known_devices.h
+# Edit secrets.h with your WiFi, MQTT, and Telegram credentials
+
+# 3. Wire the sensor (see table below) and connect ESP32 via USB
+
+# 4. Build and flash
+pio run -e ld2450_lab --target upload
+
+# 5. First boot: connect to the WiFi AP "esp32-ld2450-XXXX" (password from AP_PASS)
+#    Configure your WiFi and MQTT in the captive portal
+#    After reboot, open http://<device-ip>/ in your browser
+```
+
+### Wiring
+
+| ESP32 | LD2450 | Signal |
+|-------|--------|--------|
+| GPIO 18 | TX | UART RX (radar data) |
+| GPIO 19 | RX | UART TX (commands) |
+| 5V | VCC | Power |
+| GND | GND | Ground |
+
+> UART baud rate: 256000, 8N1, Serial2. For ESP32-C6, use the same pins -- native USB is on a separate interface.
+
+---
+
+## How It Works
+
+The LD2450 radar continuously scans a 120-degree field at 24 GHz, reporting X/Y coordinates and speed for up to 3 targets simultaneously at ~10 Hz. The ESP32 reads these frames over UART and runs them through a multi-stage processing pipeline.
+
+```
+  LD2450 Radar            ESP32 Processing Pipeline             Outputs
+ +------------+     +-----------------------------------+    +-----------+
+ |  24 GHz    | UART|  Frame Parser (3 targets/frame)   |    |  MQTT/HA  |
+ |  FMCW      |---->|  Kalman Filter (EKF2D per target) |    |  Telegram |
+ |  120 deg   |     |  Ghost Detector (noise map)       |--->|  Siren    |
+ |  3 targets |     |  Zone Classifier (polygon/bbox)   |    |  Web UI   |
+ |  ~10 Hz    |     |  Alarm State Machine              |    |  BLE      |
+ +------------+     +-----------------------------------+    +-----------+
+```
+
+### Alarm State Machine
+
+```
+                    arm (with delay)
+  DISARMED ──────────────────────> ARMING
+      ^                              |
+      |  disarm                      | exit delay expires
+      |                              v
+      +<─────── TRIGGERED <──── ARMED
+                    ^               |
+                    |               | target in zone
+                    | entry delay   v
+                    +────────── PENDING
+```
+
+States: **DISARMED** -> **ARMING** (exit delay) -> **ARMED** -> **PENDING** (entry delay) -> **TRIGGERED** -> auto-rearm or disarm.
+
+---
+
+## Features
+
+### :lock: Security
+
+| Feature | Description |
+|---------|-------------|
+| Alarm state machine | 5 states with configurable entry/exit delays |
+| Polygon detection zones | 2 user-defined polygon zones with up to 8 vertices each |
+| Blackout zones | Up to 5 rectangular exclusion areas (HVAC, furniture, windows) |
+| Anti-masking | Detects sensor obstruction (prolonged zero targets when armed) |
+| Loitering detection | Alert when target lingers beyond timeout |
+| RSSI anomaly detection | WiFi jamming alert with baseline tracking |
+| Auto-rearm | Re-arms after trigger timeout (default 15 min) |
+| Siren/strobe output | Optional GPIO for audible/visual alarm |
+| Disarm reminder | Notification if system left disarmed |
+
+### :dart: Tracking
+
+| Feature | Description |
+|---------|-------------|
+| Multi-target tracking | Up to 3 simultaneous targets with X/Y/speed |
+| Extended Kalman Filter | EKF2D per target for smooth trajectory estimation |
+| Target association | Hungarian-algorithm-inspired matching across frames |
+| Ghost detection | Static targets exceeding timeout classified as ghosts |
+| AI noise learning | 80x80 grid noise map learns static reflectors (1h calibration) |
+| Configurable filtering | Min target size, static energy threshold, motion/position thresholds |
+| Live radar map | Real-time 2D visualization with trails, zones, and noise overlay |
+
+### :satellite: Connectivity
+
+| Feature | Description |
+|---------|-------------|
+| MQTT + Home Assistant | Auto-discovery, all entities created automatically |
+| MQTTS (TLS) | Optional encrypted MQTT with certificate expiry monitoring |
+| Telegram bot | 7 commands: arm, disarm, arm_now, status, mute, unmute, restart |
+| BLE configuration | NimBLE peripheral for mobile setup (passkey-protected) |
+| WiFi failover | Backup SSID with automatic reconnection |
+| OTA updates | Web-based and ArduinoOTA firmware upload |
+| Dead Man's Switch | Auto-restart if no MQTT publish in 60 min |
+
+### :bar_chart: Diagnostics
+
+| Feature | Description |
+|---------|-------------|
+| Radar health score | Composite 0--100% health metric |
+| UART monitoring | Frame rate, error count tracking |
+| Heap monitoring | Free/min with low-memory warnings |
+| Event log | LittleFS-backed event history with web UI |
+| Heartbeat | Periodic MQTT ping (configurable interval) |
+| Certificate monitoring | TLS cert expiry warning via MQTT |
+
+### :computer: Interface
+
+| Feature | Description |
+|---------|-------------|
+| Web dashboard | Responsive dark/light UI with live radar map and SSE updates |
+| REST API | Full config, telemetry, alarm, zone, and OTA endpoints |
+| Config backup/restore | JSON export/import of all settings |
+| mDNS | `http://hostname.local/` access |
+
+---
+
+## Web Dashboard
+
+Dark-mode responsive web UI accessible at `http://<device-ip>/`.
+
+| Dashboard + Radar Map | Alarm & Schedule | Network |
+|:---:|:---:|:---:|
+| ![Dashboard](docs/screenshots/dashboard-radar.png) | ![Alarm](docs/screenshots/alarm-settings.png) | ![Network](docs/screenshots/network.png) |
+
+| Zones | System / OTA |
+|:---:|:---:|
+| ![Zones](docs/screenshots/zones.png) | ![System](docs/screenshots/system-ota.png) |
+
+**Tabs:**
+
+- **Radar** -- detection width/range, rotation, filtering thresholds, hostname
+- **Alarm** -- entry/exit delays, anti-masking, loitering, heartbeat, RSSI security
+- **Zones** -- polygon zone editor (click-to-add), blackout zone drawing and manual entry
+- **Network** -- MQTT, WiFi backup, Telegram, credentials
+- **Log** -- event history with clear function
+- **System** -- AI noise learning, OTA firmware upload, config backup/restore
+
+> The entire UI is embedded as a single PROGMEM string. No external files, no SD card.
+
+---
+
+## Telegram Bot
+
+Create a bot via [@BotFather](https://t.me/BotFather), add token and chat ID to `secrets.h`.
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Command list |
+| `/arm` | Arm with exit delay |
+| `/arm_now` | Arm immediately |
+| `/disarm` | Disarm |
+| `/status` | Alarm state, target count, IP, RSSI, uptime, heap |
+| `/mute` | Mute notifications for 10 min |
+| `/unmute` | Enable notifications |
+| `/restart` | Restart ESP32 |
+
+---
+
+## API Reference
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/version` | GET | Firmware version string |
+| `/api/telemetry` | GET | Targets (x, y, speed, type), zone config, noise state |
+| `/api/diagnostics` | GET | MQTT, WiFi RSSI, uptime, heap, health score, frame rate |
+| `/api/config` | POST | Update radar config (width, range, thresholds, rotation) |
+| `/api/alarm/state` | GET | Alarm state, armed flag, delays |
+| `/api/alarm/arm` | POST | Arm the system |
+| `/api/alarm/disarm` | POST | Disarm the system |
+| `/api/alarm/config` | POST | Entry/exit delays, disarm reminder |
+| `/api/security/config` | GET/POST | Anti-masking, loitering, heartbeat, RSSI thresholds |
+| `/api/events` | GET | Event log (JSON) |
+| `/api/events/clear` | POST | Clear event log |
+| `/api/blackout/add` | POST | Add blackout zone |
+| `/api/blackout/delete` | POST | Delete blackout zone |
+| `/api/blackout/update` | POST | Enable/disable blackout zone |
+| `/api/polygon/add_current` | POST | Add current target position as polygon point |
+| `/api/polygon/set` | POST | Set/clear polygon zone |
+| `/api/noise/start` | POST | Start noise learning |
+| `/api/noise/stop` | POST | Stop and save noise map |
+| `/api/noise/toggle` | POST | Toggle noise filter |
+| `/api/noisemap` | GET | Raw noise map (binary, 80x80 uint16) |
+| `/api/ota` | POST | Web OTA firmware upload |
+| `/api/config/export` | GET | Export config as JSON |
+| `/api/config/import` | POST | Import config from JSON |
+| `/api/mqtt/config` | POST | MQTT broker settings |
+| `/api/wifi/config` | GET/POST | Backup WiFi config |
+| `/api/telegram/config` | GET/POST | Telegram bot settings |
+| `/api/telegram/test` | POST | Send test message |
+| `/api/auth/config` | POST | Change web credentials |
+| `/api/restart` | POST | Restart ESP32 |
+| `/events` | SSE | Server-Sent Events stream (alarm state changes) |
+
+### MQTT Topics
+
+Prefix: `security/<device_id>/`
+
+| Topic | Direction | Description |
+|-------|-----------|-------------|
+| `presence/state` | publish | IDLE / PRESENCE / HOLD |
+| `presence/count` | publish | Number of active targets |
+| `alarm/state` | publish | disarmed / arming / armed_away / pending / triggered |
+| `alarm/command` | subscribe | arm / disarm / arm_now |
+| `notification` | publish | System notifications (OTA, alerts, learning) |
+| `diag/rssi` | publish | WiFi signal strength |
+| `diag/health_score` | publish | Radar health 0--100 |
+| `diag/heap_free` | publish | Free heap bytes |
+| `availability` | publish | online / offline (LWT) |
+
+---
+
+## System Architecture
+
+```
+src/ld2450/
+ +-- main_ld2450.cpp           Entry point, WiFi, OTA, service orchestration
+ +-- services/
+      +-- LD2450Service.cpp    Radar driver (UART parser, 3-target extraction)
+      +-- PresenceService.cpp  Presence logic, noise learning, WiFi reconnect
+      +-- SecurityMonitor.cpp  Alarm state machine, tamper detection, health
+      +-- MQTTService.cpp      HA auto-discovery, TLS, publish/subscribe
+      +-- WebService.cpp       REST API + SSE + OTA handler (~40 endpoints)
+      +-- TelegramService.cpp  Bot polling + command handler
+      +-- BluetoothService.cpp NimBLE peripheral for mobile config
+      +-- ConfigManager.cpp    NVS persistence layer
+      +-- EventLog.cpp         LittleFS event ring buffer
+
+include/ld2450/
+ +-- constants.h               All timing, thresholds, pin defaults
+ +-- types.h                   Data structures, enums, AppContext
+ +-- web_interface.h           Embedded HTML/CSS/JS dashboard
+ +-- utils/
+      +-- EKF2D.h              2D Extended Kalman Filter [x,y,vx,vy]
+      +-- Kalman.h             1D Kalman filter
+      +-- TargetAssociation.h  Cross-frame target matching
+
+include/
+ +-- secrets_example.h         Credential template
+ +-- ld2450/known_devices.h.example  Multi-device MAC mapping template
+```
+
+### Data Flow
+
+```
+  UART RX (~10 Hz, 3 targets per frame)
+       |
+  [LD2450Service] Frame parser -> target extraction [x, y, speed, resolution]
+       |
+  [PresenceService] Kalman filtering -> ghost detection -> noise map filtering
+       |
+  [SecurityMonitor] Zone classification -> alarm state machine -> event queue
+       |
+  [main_ld2450.cpp] Dispatches to:
+       +-- MQTTService (HA auto-discovery, telemetry publish)
+       +-- TelegramService (bot commands + alerts)
+       +-- WebService (SSE real-time stream, REST API)
+       +-- EventLog (LittleFS persistence)
+       +-- BluetoothService (BLE config)
+```
+
+---
+
+## How to Update / Downgrade Sensor Firmware
+
+The LD2450 radar module has its own firmware, separate from the ESP32. You can change it using the **HLKRadarTool** Bluetooth app.
+
+> [!WARNING]
+> Firmware changes are at your own risk. There is no official rollback mechanism. Always note your current version before changing.
+
+**Steps:**
+
+1. **Install HLKRadarTool** -- [Android](https://play.google.com/store/apps/details?id=com.hlk.hlkradartool) / [iOS](https://apps.apple.com/app/hlkradartool/id6475738581)
+2. **Power cycle** the LD2450 module (disconnect and reconnect 5V -- the BLE interface only activates for ~30 seconds after power-on)
+3. **Connect** via Bluetooth in HLKRadarTool (device shows as `HLK-LD2450_XXXX`)
+4. **Select firmware version** from the available list and flash
+5. **Power cycle** the module again after flashing
+6. **Verify** via the web dashboard or serial console at boot
+
+**The HLKRadarTool app is also used for:**
+- Viewing real-time target data
+- Changing detection parameters
+- Baud rate configuration
+
+---
+
+## Known Issues & Limitations
+
+> [!WARNING]
+> The LD2450 is a **multi-target** radar but reports at most 3 targets per frame. In crowded spaces, targets may swap IDs between frames. The Kalman filter and target association algorithm mitigate this, but rapid crossovers can still cause brief glitches.
+
+<details>
+<summary><strong>Hardware limitations</strong></summary>
+
+- Maximum 3 simultaneous targets (hardware limit of LD2450)
+- 120-degree detection cone -- blind spots on the sides
+- Radar sees through drywall and thin partitions (can detect neighbors)
+
+
+</details>
+
+<details>
+<summary><strong>Software limitations</strong></summary>
+
+- Web UI is a PROGMEM string -- editing requires firmware rebuild
+- No multi-sensor coordination yet (each node is independent)
+- Noise learning requires ~1 hour in an empty room
+- Blackout zones are rectangular only (polygons for detection zones only)
+- No persistent MQTT offline buffer (unlike LD2412 version)
+
+</details>
+
+<details>
+<summary><strong>Compared to LD2412-security</strong></summary>
+
+| Aspect | LD2450 (this project) | [LD2412-security](https://github.com/PeterkoCZ91/HLK-LD2412-security) |
+|--------|:---------------------|:------------------------------------------------------------------|
+| Targets | 3 simultaneous with X/Y/speed | 1 with distance + energy |
+| Detection | 2D polygon zones | 1D distance-based zones (16 zones) |
+| Tracking | Kalman filter, trails, radar map | Approach tracker, direction inference |
+| Ghost handling | AI noise map (80x80 grid) | Static reflector learning |
+| Unit tests | -- | 41 tests |
+| MQTT offline buffer | -- | LittleFS queue |
+| BLE config | :white_check_mark: NimBLE | -- |
+| Engineering mode | N/A (LD2450 has no gates) | Per-gate energy visualization |
+
+The two projects share the same alarm state machine, security architecture, and web UI patterns. They are designed to complement each other in a multi-sensor deployment.
+
+</details>
+
+---
+
+## Roadmap
+
+| Feature | Status | Description |
+|---------|--------|-------------|
+| Multi-sensor fusion | :bulb: Planned | LD2450 + LD2412 + WiFi CSI cross-validation via MQTT |
+| Camera PTZ tracking | :bulb: Planned | Steer PTZ camera to follow radar targets |
+| Scheduled arm/disarm | :white_check_mark: Done | Time-based auto arm/disarm + inactivity auto-arm (v5.5.3) |
+| MQTT offline buffer | :white_check_mark: Done | LittleFS ring buffer, 30 messages, survives reboot (v5.5.3) |
+| Entry/exit counter | :white_check_mark: Done | Virtual tripwire line with directional counting (v5.5.3) |
+| Movement classification | :white_check_mark: Done | Standing/walking/running per target (v5.5.3) |
+| Zone dwell time | :white_check_mark: Done | Per-target time spent in polygon zones (v5.5.3) |
+| Kalman filter tracking | :white_check_mark: Done | EKF2D per target (v5.4) |
+| Blackout zone drawing | :white_check_mark: Done | Draw on radar map (v5.3) |
+| AI noise learning | :white_check_mark: Done | 80x80 noise map (v5.2) |
+| Security audit port | :white_check_mark: Done | 13 fixes from LD2412 audit (v5.5) |
+
+---
+
+## FAQ
+
+<details>
+<summary><strong>Do I need Home Assistant?</strong></summary>
+
+No. The system works fully standalone with the web dashboard and Telegram bot. Home Assistant adds remote control via MQTT and nice dashboards, but it's optional.
+
+</details>
+
+<details>
+<summary><strong>What's the difference between LD2450 and LD2412?</strong></summary>
+
+The **LD2412** reports 1 target with distance and energy levels across 14 detection gates. The **LD2450** reports up to 3 targets with 2D X/Y coordinates and speed, but no energy data. LD2450 is better for tracking *where* people are; LD2412 is better for *how much* activity there is. For best results, use both with the [sensor fusion](https://github.com/PeterkoCZ91/HLK-LD2412-security) system.
+
+</details>
+
+<details>
+<summary><strong>How do I reduce false alarms?</strong></summary>
+
+1. **AI noise learning** -- run the 1h calibration in an empty room to build a noise map
+2. **Blackout zones** -- exclude known reflectors (HVAC, metal furniture, antennas)
+3. **Min target size** -- increase to filter small reflections
+4. **Ghost timeout** -- reduce to classify static objects faster
+5. **Polygon zones** -- limit detection to specific areas only
+
+</details>
+
+<details>
+<summary><strong>Can it detect through walls?</strong></summary>
+
+Yes, 24 GHz radar penetrates drywall, wood, and thin partitions. Use blackout zones and polygon zones to limit the effective detection area.
+
+</details>
+
+<details>
+<summary><strong>What happens when WiFi goes down?</strong></summary>
+
+The alarm keeps running locally. Events are logged to flash. A Dead Man's Switch restarts the ESP32 if MQTT is unreachable for 60 minutes.
+
+</details>
+
+<details>
+<summary><strong>How much does it cost?</strong></summary>
+
+About $12 for a single node (ESP32 + LD2450 + power supply). No subscriptions, no cloud fees.
+
+</details>
+
+---
+
+## Testing
+
+```bash
+# Build for lab (USB flash)
+pio run -e ld2450_lab
+
+# Flash via USB
+pio run -e ld2450_lab --target upload
+
+# Flash via OTA (change IP in platformio.ini first)
+pio run -e ld2450_prod --target upload
+```
+
+### Build Environments
+
+| Environment | Board | Upload | Use case |
+|-------------|-------|--------|----------|
+| `ld2450_lab` | ESP32-WROOM | USB | Development, debug |
+| `ld2450_prod` | ESP32-WROOM | OTA | Production deployment |
+
+### Multi-Device OTA
+
+Each device identifies itself by MAC address using the `known_devices.h` lookup table:
+
+```c
+{ "aa:bb:cc:dd:ee:f1", "ld2450_living_room", "sensor-ld2450-living-room" },
+{ "aa:bb:cc:dd:ee:f2", "ld2450_hallway",     "sensor-ld2450-hallway" },
+```
+
+---
+
+## Real-World Deployment
+
+Running in production since 2025 monitoring residential spaces with multiple LD2450 and LD2412 nodes.
+
+### Hardware Tested
+
+| Board | Chip | Notes |
+|-------|------|-------|
+| ESP32 DevKit (generic) | ESP32-WROOM-32 | Primary platform, reliable |
+
+### Memory Profile
+
+| Metric | Value |
+|--------|-------|
+| Free heap at boot | ~60 KB |
+| Firmware size | ~1.4 MB |
+| Noise map size | 12.5 KB (80x80 x uint16) |
+| Web UI (PROGMEM) | ~44 KB |
+| Codebase | ~6000 LOC |
+
+---
+
+## Security & Privacy
+
+<details>
+<summary><strong>Data handling</strong></summary>
+
+- All data processed locally on the ESP32
+- No telemetry, analytics, or data sent to third parties
+- Radar coordinates stay on your network (MQTT to your broker only)
+- Event log stored on device flash (LittleFS)
+
+</details>
+
+<details>
+<summary><strong>Network exposure</strong></summary>
+
+- Web UI on port 80 (HTTP) with username/password authentication
+- Optional MQTTS (TLS on port 8883) with CA certificate validation
+- BLE pairing requires a 6-digit passkey
+- Default credentials (admin/admin) trigger a warning banner in the web UI
+
+</details>
+
+---
+
+## Development History
+
+Evolved from a simple presence detector into a full multi-target security system over 50+ versions.
+
+| Phase | Versions | Focus |
+|-------|----------|-------|
+| Foundation | v1.x--v3.x | Basic presence, MQTT, web UI |
+| Multi-target | v4.x | Target tracking, polygon zones, radar map |
+| Intelligence | v5.0--v5.2 | Kalman filter, ghost detection, AI noise learning |
+| Security hardening | v5.3--v5.5 | Blackout zones, BLE config, LD2412 audit port, ESP32-C6 |
+
+See [CHANGELOG.md](CHANGELOG.md) for detailed version history.
+
+---
+
+## Acknowledgments
+
+- [HLK-LD2450](https://www.hlktech.net/) -- Hi-Link 24 GHz multi-target radar module
+- [LD2412-security](https://github.com/PeterkoCZ91/HLK-LD2412-security) -- sister project, shared alarm architecture
+- [ESPAsyncWebServer](https://github.com/mathieucarbou/ESPAsyncWebServer) -- async HTTP/SSE server
+- [NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino) -- lightweight BLE stack
+- [ArduinoJson](https://github.com/bblanchon/ArduinoJson) -- JSON processing
+- [PubSubClient](https://github.com/knolleary/pubsubclient) -- MQTT client
+
+---
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/my-feature`)
+3. Test your changes
+4. Open a pull request with a clear description
+
+Bug reports and feature requests welcome via [GitHub Issues](../../issues).

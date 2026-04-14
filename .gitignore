@@ -1,0 +1,25 @@
+# PlatformIO
+.pio/
+.vscode/
+
+# Build artifacts
+*.bin
+*.elf
+
+# Secrets
+include/secrets.h
+include/ld2450/known_devices.h
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Logs
+logs/
