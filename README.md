@@ -92,7 +92,7 @@ git clone https://github.com/PeterkoCZ91/HLK-LD2450-security.git
 cd HLK-LD2450-security
 
 # 2. Create your config files
-cp include/secrets_example.h include/secrets.h
+cp include/secrets.h.example include/secrets.h
 cp include/ld2450/known_devices.h.example include/ld2450/known_devices.h
 # Edit secrets.h with your WiFi, MQTT, and Telegram credentials
 
@@ -338,7 +338,7 @@ include/ld2450/
       +-- TargetAssociation.h  Cross-frame target matching
 
 include/
- +-- secrets_example.h         Credential template
+ +-- secrets.h.example         Credential template
  +-- ld2450/known_devices.h.example  Multi-device MAC mapping template
 ```
 
