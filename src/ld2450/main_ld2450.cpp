@@ -76,6 +76,10 @@ PolygonZone detectionPolygons[MAX_POLYGONS];
 uint8_t polyCount = 0;
 BlackoutZone blackoutZones[MAX_BLACKOUT_ZONES];
 uint8_t blackoutZoneCount = 0;
+// Day/Night profile masks (parallel arrays). bit0=day, bit1=night. Default 0x03 = both.
+uint8_t polygonMasks[MAX_POLYGONS] = {0x03, 0x03, 0x03, 0x03, 0x03};
+uint8_t blackoutMasks[MAX_BLACKOUT_ZONES] = {0x03, 0x03, 0x03, 0x03, 0x03};
+uint8_t currentProfile = 0x01;  // Default day until first scheduler tick
 GhostTracker ghostTracker;
 TargetHistory targetHistory;
 Tripwire tripwire;
@@ -108,7 +112,12 @@ void safeRestart(const char* reason) {
     // Restart history (last 5 entries as JSON)
     String history = p.getString("rst_history", "[]");
     JsonDocument doc;
-    deserializeJson(doc, history);
+    DeserializationError derr = deserializeJson(doc, history);
+    // Pokud NVS obsahuje korupci nebo není pole, začni načisto — jinak by arr.add() byl UB.
+    if (derr != DeserializationError::Ok || !doc.is<JsonArray>()) {
+        doc.clear();
+        doc.to<JsonArray>();
+    }
     JsonArray arr = doc.as<JsonArray>();
     // Keep max 5 entries
     while (arr.size() >= 5) arr.remove(0);
@@ -134,22 +143,88 @@ void saveBlackoutZonesFn() {
     preferences.begin("ld2450-zones", false);
     preferences.putBytes("blackout", blackoutZones, sizeof(blackoutZones));
     preferences.putUChar("bz_count", blackoutZoneCount);
+    preferences.putBytes("bz_masks", blackoutMasks, sizeof(blackoutMasks));
     preferences.end();
 }
 
-// --- MQTT CALLBACK (alarm commands from HA) ---
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-    String msg;
-    for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+void savePolygonsFn() {
+    preferences.begin("ld2450-zones", false);
+    preferences.putBytes("polygons", detectionPolygons, sizeof(detectionPolygons));
+    preferences.putUChar("poly_count", polyCount);
+    preferences.putBytes("poly_masks", polygonMasks, sizeof(polygonMasks));
+    preferences.end();
+}
 
-    // Check alarm command topic (HA MQTT Alarm Panel protocol)
-    if (String(topic) == mqttService.getTopics().alarm_command) {
-        if (msg == "ARM_AWAY") {
-            securityMonitor.setArmed(true, false, false);
-        } else if (msg == "ARM_HOME") {
-            securityMonitor.setArmed(true, false, true);
-        } else if (msg == "DISARM") {
+static void loadPolygonsFn() {
+    Preferences p;
+    p.begin("ld2450-zones", true);
+    polyCount = p.getUChar("poly_count", 0);
+    if (polyCount > MAX_POLYGONS) polyCount = 0;
+    if (polyCount > 0) {
+        p.getBytes("polygons", detectionPolygons, sizeof(detectionPolygons));
+    }
+    if (p.isKey("poly_masks")) {
+        p.getBytes("poly_masks", polygonMasks, sizeof(polygonMasks));
+    }
+    if (p.isKey("bz_masks")) {
+        p.getBytes("bz_masks", blackoutMasks, sizeof(blackoutMasks));
+    }
+    p.end();
+}
+
+void saveNoiseMapFn() {
+    if (!noiseMap) return;
+    File f = LittleFS.open("/noisemap.bin", FILE_WRITE);
+    if (f) {
+        f.write((uint8_t*)noiseMap->energy, sizeof(noiseMap->energy));
+        f.close();
+        Serial.println("[NoiseMap] Saved (callback)");
+    }
+}
+
+// --- MQTT CALLBACK (alarm commands from HA) ---
+// Protokol HA MQTT Alarm Panel: payload může být buď čistý příkaz "DISARM",
+// nebo JSON `{"action":"DISARM","code":"1234"}` (když je v HA `code_disarm_required=true`).
+// Aby DISARM přes MQTT vyžadoval kód, kontrolujeme NVS klíč `sec_code`. Pokud je prázdný,
+// MQTT DISARM funguje bez kódu (uživatel kód nikdy nenastavil → backwards compat).
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    if (length == 0 || length > 256) return;
+    char buf[257];
+    memcpy(buf, payload, length);
+    buf[length] = '\0';
+
+    if (strcmp(topic, mqttService.getTopics().alarm_command) != 0) return;
+
+    // Detekce JSON tvaru
+    String action;
+    String code;
+    if (buf[0] == '{') {
+        JsonDocument doc;
+        if (deserializeJson(doc, buf, length) == DeserializationError::Ok) {
+            if (doc["action"].is<const char*>()) action = doc["action"].as<const char*>();
+            if (doc["code"].is<const char*>())   code   = doc["code"].as<const char*>();
+        }
+    } else {
+        action = buf;
+    }
+
+    if (action == "ARM_AWAY") {
+        securityMonitor.setArmed(true, false, false);
+    } else if (action == "ARM_HOME") {
+        securityMonitor.setArmed(true, false, true);
+    } else if (action == "DISARM") {
+        Preferences p;
+        p.begin("ld2450_config", true);
+        String requiredCode = p.getString("sec_code", "");
+        p.end();
+        if (requiredCode.length() == 0 || requiredCode == code) {
             securityMonitor.setArmed(false);
+        } else {
+            Serial.println("[MQTT] DISARM rejected: invalid/missing code");
+            // Volitelná notifikace
+            if (mqttService.connected()) {
+                mqttService.publish(mqttService.getTopics().notification, "DISARM rejected: invalid code", false);
+            }
         }
     }
 }
@@ -222,10 +297,10 @@ void setupWiFi() {
   wm->setConnectTimeout(20);
   wm->setAPStaticIPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
 
-  AsyncWiFiManagerParameter* p_server = new AsyncWiFiManagerParameter("mqtt_server", "MQTT Server", cfg.mqtt_server, 40);
-  AsyncWiFiManagerParameter* p_port = new AsyncWiFiManagerParameter("mqtt_port", "MQTT Port", cfg.mqtt_port, 6);
-  AsyncWiFiManagerParameter* p_user = new AsyncWiFiManagerParameter("mqtt_user", "MQTT User", cfg.mqtt_user, 32);
-  AsyncWiFiManagerParameter* p_pass = new AsyncWiFiManagerParameter("mqtt_pass", "MQTT Password", cfg.mqtt_pass, 32, "type='password'");
+  AsyncWiFiManagerParameter* p_server = new AsyncWiFiManagerParameter("mqtt_server", "MQTT Server", cfg.mqtt_server, sizeof(cfg.mqtt_server));
+  AsyncWiFiManagerParameter* p_port = new AsyncWiFiManagerParameter("mqtt_port", "MQTT Port", cfg.mqtt_port, sizeof(cfg.mqtt_port));
+  AsyncWiFiManagerParameter* p_user = new AsyncWiFiManagerParameter("mqtt_user", "MQTT User", cfg.mqtt_user, sizeof(cfg.mqtt_user));
+  AsyncWiFiManagerParameter* p_pass = new AsyncWiFiManagerParameter("mqtt_pass", "MQTT Password", cfg.mqtt_pass, sizeof(cfg.mqtt_pass), "type='password'");
 
   wm->addParameter(p_server);
   wm->addParameter(p_port);
@@ -242,6 +317,10 @@ void setupWiFi() {
       strncpy(cfg.mqtt_port, p_port->getValue(), sizeof(cfg.mqtt_port) - 1);
       strncpy(cfg.mqtt_user, p_user->getValue(), sizeof(cfg.mqtt_user) - 1);
       strncpy(cfg.mqtt_pass, p_pass->getValue(), sizeof(cfg.mqtt_pass) - 1);
+      cfg.mqtt_server[sizeof(cfg.mqtt_server) - 1] = '\0';
+      cfg.mqtt_port[sizeof(cfg.mqtt_port) - 1] = '\0';
+      cfg.mqtt_user[sizeof(cfg.mqtt_user) - 1] = '\0';
+      cfg.mqtt_pass[sizeof(cfg.mqtt_pass) - 1] = '\0';
       configManager.save();
   }
 
@@ -370,6 +449,29 @@ void setup() {
   // Radar
   if (!radar.begin(Serial2)) {
     Serial.println("[RADAR] Failed to init serial!");
+  } else {
+    // Dedikovaný UART task na Core 1 (stejné jádro jako loop), priorita 2 (nad loop=1).
+    // Eliminuje UART overflow při dlouhých blokujících operacích v hlavní smyčce
+    // (MQTT TLS handshake, NVS write, mbedtls cert parse).
+    radar.startTask(4096, 2, 1);
+
+    // Push native region filter (cmd 0xC2) z NVS, pokud je aktivní.
+    // Filter se aplikuje hardwarově v modulu ještě před UART → cíle jsou
+    // odfiltrované dřív, než dorazí do parser-bufferu.
+    {
+        const SystemConfig& rfCfg = configManager.getConfig();
+        if (rfCfg.region_filter_mode != 0) {
+            LD2450Service::RegionFilter rf{};
+            rf.mode = rfCfg.region_filter_mode;
+            for (uint8_t z = 0; z < 3; z++) {
+                rf.x1[z] = rfCfg.region_filter_zones[z * 4 + 0];
+                rf.y1[z] = rfCfg.region_filter_zones[z * 4 + 1];
+                rf.x2[z] = rfCfg.region_filter_zones[z * 4 + 2];
+                rf.y2[z] = rfCfg.region_filter_zones[z * 4 + 3];
+            }
+            radar.setRegionFilter(rf);
+        }
+    }
   }
   Serial.printf("[HEAP] After Radar: %u\n", ESP.getFreeHeap());
 
@@ -409,16 +511,29 @@ void setup() {
   appContext.blackoutZoneCount = &blackoutZoneCount;
   appContext.polygons = detectionPolygons;
   appContext.polyCount = &polyCount;
+  appContext.polygonMasks = polygonMasks;
+  appContext.blackoutMasks = blackoutMasks;
+  appContext.currentProfile = &currentProfile;
   appContext.deviceId = device_id;
   appContext.deviceHostname = device_hostname;
   appContext.authUser = cfg.auth_user;
   appContext.authPass = cfg.auth_pass;
   appContext.useNoiseFilter = &useNoiseFilter;
   appContext.saveBlackoutZones = saveBlackoutZonesFn;
+  appContext.savePolygons = savePolygonsFn;
+  appContext.saveNoiseMap = saveNoiseMapFn;
   appContext.shouldReboot = &shouldReboot;
+
+  // Načti polygony z NVS (analogicky blackout zones)
+  loadPolygonsFn();
   appContext.telegram = &telegramService;
   appContext.bluetooth = &bluetoothService;
   appContext.dataMutex = xSemaphoreCreateMutex();
+  if (!appContext.dataMutex) {
+      Serial.println("[SETUP] FATAL: dataMutex create failed");
+      delay(2000);
+      safeRestart("mutex_create_failed");
+  }
 
   // WebService
   webService.begin(&appContext, &server);
@@ -580,6 +695,36 @@ void loop() {
           Serial.printf("[SCHED] Auto-disarmed at %s\n", disT);
           if (telegramService.isEnabled()) telegramService.sendMessage("🔓 Scheduled disarm (" + String(disT) + ")");
         }
+      }
+    }
+  }
+
+  // Day/Night zone profile selector (check every 30s, shares time-since check with scheduled arm)
+  // Pokud night_start_time je prázdný, profil zůstává day. Jinak: porovnej HH:MM s aktuální dobou.
+  // Pokud start < end (např. 22:00 → 06:00 nestandardní), použiju logiku: noc = čas v intervalu nebo přes půlnoc.
+  {
+    static unsigned long lastProfCheck = 0;
+    if (now - lastProfCheck > 30000) {
+      lastProfCheck = now;
+      const char* nsT = configManager.getConfig().night_start_time;
+      const char* neT = configManager.getConfig().night_end_time;
+      uint8_t newProfile = 0x01; // default day
+      if (strlen(nsT) >= 4 && strlen(neT) >= 4) {
+        time_t epoch = time(nullptr);
+        if (epoch > 1700000000) {
+          struct tm ti; localtime_r(&epoch, &ti);
+          int cur = ti.tm_hour * 60 + ti.tm_min;
+          int sh, sm, eh, em;
+          if (sscanf(nsT, "%d:%d", &sh, &sm) == 2 && sscanf(neT, "%d:%d", &eh, &em) == 2) {
+            int s = sh*60+sm, e = eh*60+em;
+            bool isNight = (s < e) ? (cur >= s && cur < e) : (cur >= s || cur < e);
+            newProfile = isNight ? 0x02 : 0x01;
+          }
+        }
+      }
+      if (newProfile != currentProfile) {
+        currentProfile = newProfile;
+        Serial.printf("[PROFILE] Switched to %s\n", currentProfile == 0x02 ? "NIGHT" : "DAY");
       }
     }
   }

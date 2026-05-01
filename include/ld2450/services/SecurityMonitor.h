@@ -4,6 +4,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <Preferences.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "ld2450/types.h"
 #include "ld2450/constants.h"
 
@@ -101,6 +103,10 @@ private:
     MQTTService* _mqttService = nullptr;
     EventLog* _eventLog = nullptr;
     Preferences* _prefs = nullptr;
+
+    // Mutex chrání alarm state mutace mezi loop tasem (Core 1) a Telegram taskem (Core 0).
+    // Bez něj může setArmed() z Telegramu kolidovat s update() / mqttCallback z hlavní smyčky.
+    SemaphoreHandle_t _stateMutex = nullptr;
 
     // Alarm state
     SecurityState _alarmState = SecurityState::DISARMED;

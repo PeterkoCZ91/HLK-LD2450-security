@@ -170,6 +170,7 @@ struct TargetHistory {
     int16_t posXHistory[3][10] = {}; // Ring buffer for last 10 X positions
     int16_t posYHistory[3][10] = {}; // Ring buffer for last 10 Y positions
     uint8_t historyIdx[3] = {0};
+    uint8_t varSamples[3] = {0}; // Skutečný počet záznamů, dokud nedosáhne 10 (cold-start fix)
     float variance[3] = {0};    // Calculated motion variance
     
     // EKF Trackers (one per target slot, state: [x,y,vx,vy])
@@ -239,6 +240,11 @@ struct AppContext {
     PolygonZone* polygons;
     uint8_t* polyCount;
 
+    // Day/Night profile masks (parallel arrays — bit0=day, bit1=night, default 0x03 = both)
+    uint8_t* polygonMasks;
+    uint8_t* blackoutMasks;
+    uint8_t* currentProfile;  // Active profile bitmask (0x01=day, 0x02=night)
+
     // Config vars (pointers)
     char* deviceId;
     char* deviceHostname;
@@ -248,6 +254,8 @@ struct AppContext {
 
     // API Helpers
     void (*saveBlackoutZones)();
+    void (*savePolygons)();
+    void (*saveNoiseMap)();
     volatile bool* shouldReboot = nullptr;
 
     // Thread Safety

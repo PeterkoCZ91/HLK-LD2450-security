@@ -92,18 +92,35 @@ void BluetoothService::stop() {
 
 void BluetoothService::startEmergency() {
     if (_isRunning) return;
+
+    // Guard 1: heap budget — NimBLE init si bere 25-30 KB. Pod 50K bychom skončili crashem.
+    uint32_t heap = ESP.getFreeHeap();
+    if (heap < 50000) {
+        Serial.printf("[BT] Emergency aborted: heap %u < 50000\n", heap);
+        return;
+    }
+
+    // Guard 2: pokud byl už NimBLE inicializován dříve a stop() volal deinit(true),
+    // re-init by měl být bezpečný; ale pokud je stack ještě "v deinit transit", pomůže delay.
     Serial.println("[BT] Emergency BLE re-activation (WiFi lost)");
     _timeoutSeconds = 600; // 10 min emergency window
     _startTime = millis();
     _isRunning = true;
 
-    NimBLEDevice::init("LD2450-EMERGENCY");
+    if (!NimBLEDevice::isInitialized()) {
+        NimBLEDevice::init("LD2450-EMERGENCY");
+    }
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
     // Emergency mode still requires passkey authentication
     NimBLEDevice::setSecurityAuth(true, true, true);
     NimBLEDevice::setSecurityPasskey(BLE_PASSKEY_DEFAULT);
     NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
     _server = NimBLEDevice::createServer();
+    if (!_server) {
+        Serial.println("[BT] Emergency: createServer failed");
+        _isRunning = false;
+        return;
+    }
 
     _configService = _server->createService(SERVICE_CONFIG_UUID);
     NimBLECharacteristic* pWiFiChar = _configService->createCharacteristic(

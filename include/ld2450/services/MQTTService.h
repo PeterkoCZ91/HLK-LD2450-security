@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClient.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -42,6 +43,8 @@ public:
     PubSubClient& getClient() { return _mqttClient; }
     const char* getServer() const { return _server; }
     const char* getPort() const { return _port; }
+    bool isEnabled() const { return _enabled; }
+    bool isTlsEnabled() const { return _tlsEnabled; }
     
     // Callback setter wrapper
     void setCallback(MQTT_CALLBACK_SIGNATURE);
@@ -53,11 +56,10 @@ private:
     String getResetReason();
 
     // Internal objects
-    #ifdef MQTTS_ENABLED
-    WiFiClientSecure _espClient;
-    #else
-    WiFiClient _espClient;
-    #endif
+    WiFiClient _plainClient;
+#ifdef MQTTS_ENABLED
+    WiFiClientSecure _secureClient;
+#endif
     
     PubSubClient _mqttClient;
     Topics _topics;
@@ -65,11 +67,13 @@ private:
     Preferences* _prefs;
     
     // Configuration
-    char _server[40];
+    char _server[60];
     char _port[6];
-    char _user[32];
-    char _pass[32];
+    char _user[40];
+    char _pass[40];
     char _deviceId[32]; // Increased size just in case
+    bool _enabled = true;
+    bool _tlsEnabled = false;
     
     // State
     bool _bootMsgSent = false;

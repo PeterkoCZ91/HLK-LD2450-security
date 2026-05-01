@@ -112,8 +112,11 @@ void PresenceService::applyRotation(int16_t& x, int16_t& y) {
 }
 
 bool PresenceService::isInBlackoutZone(int16_t x, int16_t y) {
+    uint8_t prof = _ctx->currentProfile ? *(_ctx->currentProfile) : 0x03;
     for (uint8_t i = 0; i < *(_ctx->blackoutZoneCount); i++) {
         if (!_ctx->blackoutZones[i].enabled) continue;
+        // Skip if zone not active in current day/night profile
+        if (_ctx->blackoutMasks && !(_ctx->blackoutMasks[i] & prof)) continue;
         if (x >= _ctx->blackoutZones[i].xMin && x <= _ctx->blackoutZones[i].xMax &&
             y >= _ctx->blackoutZones[i].yMin && y <= _ctx->blackoutZones[i].yMax) {
             return true;
@@ -131,9 +134,10 @@ void PresenceService::processNoiseLearning(unsigned long now) {
             _ctx->noiseMap->learning = true;
             _ctx->noiseMap->startTime = now;
             _ctx->noiseMap->samples = 0;
-            Serial.println("[NoiseMap] 🚀 Learning STARTED!");
+            Serial.println("[NoiseMap] Learning STARTED");
             if (_ctx->mqtt->connected()) {
-                _ctx->mqtt->publish(_ctx->mqtt->getTopics().notification, "🤖 AI Learning STARTED. Do not move!", false);
+                _ctx->mqtt->publish(_ctx->mqtt->getTopics().notification,
+                                    "Noise map learning STARTED. Please stay still.", false);
             }
         }
     }
@@ -233,24 +237,21 @@ void PresenceService::checkMqttWatchdog(unsigned long now) {
 }
 
 void PresenceService::checkRSSIAnomaly(unsigned long now) {
-    if (now - _lastRSSICheck > 60000) {
-        int32_t currentRSSI = WiFi.RSSI();
-        if (_ctx->netQuality->rssiBaseline == 0) {
-            _ctx->netQuality->rssiBaseline = currentRSSI;
-            return;
-        }
-        // EMA
-        _ctx->netQuality->rssiBaseline = (_ctx->netQuality->rssiBaseline * 9 + currentRSSI) / 10;
-        
-        int32_t rssiDelta = abs(currentRSSI - _ctx->netQuality->rssiBaseline);
-        if (rssiDelta > 20 && !_ctx->tamperState->tamperDetected) {
-            _ctx->tamperState->tamperDetected = true;
-            strncpy(_ctx->tamperState->tamperReason, "RSSI_ANOMALY_DETECTED", sizeof(_ctx->tamperState->tamperReason) - 1);
-             if (_ctx->mqtt->connected()) {
-                _ctx->mqtt->publish(_ctx->mqtt->getTopics().tamper, "RSSI_ANOMALY_DETECTED", false);
-            }
-        }
-        _lastRSSICheck = now;
+    if (now - _lastRSSICheck < 60000) return;
+    _lastRSSICheck = now;
+
+    long currentRSSI = WiFi.RSSI();
+    // Maintain EMA baseline pro UI/diagnostics
+    if (_ctx->netQuality->rssiBaseline == 0) {
+        _ctx->netQuality->rssiBaseline = currentRSSI;
+        return;
+    }
+    _ctx->netQuality->rssiBaseline = (_ctx->netQuality->rssiBaseline * 9 + currentRSSI) / 10;
+
+    // Vlastní detekci anomálií / alertování deleguj na SecurityMonitor (jediný owner).
+    // Předtím tu byla duplicitní logika.
+    if (_ctx->security) {
+        _ctx->security->checkRSSIAnomaly(currentRSSI);
     }
 }
 
@@ -304,6 +305,18 @@ void PresenceService::processRadarData(unsigned long now) {
             gt->staticSince[i] = 0;
             gt->isGhost[i] = false;
             gt->inZone[i] = false;
+            // Reset variance — slot může být ihned re-použit pro jiný cíl
+            th->varSamples[i] = 0;
+            th->historyIdx[i] = 0;
+            // Reset tripwire side — jinak hrozí false count při re-detekci na opačné straně
+            if (_ctx->tripwire) _ctx->tripwire->lastSide[i] = 0;
+            // Reset analytics dwell
+            if (_ctx->analytics) {
+                _ctx->analytics->moveClass[i] = MoveClass::NONE;
+                _ctx->analytics->dwellMs[i] = 0;
+                _ctx->analytics->dwellStart[i] = 0;
+                _ctx->analytics->inPolyZone[i] = false;
+            }
             continue;
         }
 
@@ -320,16 +333,23 @@ void PresenceService::processRadarData(unsigned long now) {
             }
 
             // Polygon check with hysteresis (skip margin for polygons - complex geometry)
+            // Filter by current day/night profile mask (default 0x03 = both)
             if (*(_ctx->polyCount) > 0) {
+                uint8_t prof = _ctx->currentProfile ? *(_ctx->currentProfile) : 0x03;
                 bool inPoly = false;
+                bool anyActive = false;
                 for (uint8_t p = 0; p < *(_ctx->polyCount); p++) {
-                    if (_ctx->polygons[p].enabled && isPointInPolygon(t.x, t.y, _ctx->polygons[p])) {
+                    if (!_ctx->polygons[p].enabled) continue;
+                    if (_ctx->polygonMasks && !(_ctx->polygonMasks[p] & prof)) continue;
+                    anyActive = true;
+                    if (isPointInPolygon(t.x, t.y, _ctx->polygons[p])) {
                         inPoly = true;
                         break;
                     }
                 }
-                // If already in zone (hysteresis), allow being slightly outside polygon
-                if (!inPoly && !gt->inZone[i]) {
+                // Pokud žádný polygon není aktivní v aktuálním profilu — chovej se jakoby polygon filtr neexistoval.
+                // If already in zone (hysteresis), allow being slightly outside polygon.
+                if (anyActive && !inPoly && !gt->inZone[i]) {
                     gt->isGhost[i] = true;
                     continue;
                 }
@@ -372,7 +392,7 @@ void PresenceService::processRadarData(unsigned long now) {
         // 5. Variance Analysis (Motion Entropy)
         // LOCK CRITICAL SECTION
         float variance = 0;
-        if (xSemaphoreTake(_ctx->dataMutex, 50 / portTICK_PERIOD_MS) == pdTRUE) {
+        if (_ctx->dataMutex && xSemaphoreTake(_ctx->dataMutex, 50 / portTICK_PERIOD_MS) == pdTRUE) {
             updateVariance(i, t.x, t.y);
             variance = th->variance[i];
             xSemaphoreGive(_ctx->dataMutex);
@@ -409,7 +429,7 @@ void PresenceService::processRadarData(unsigned long now) {
         if (!gt->isGhost[i]) {
             currentTargetValid[i] = true;
 
-            if (xSemaphoreTake(_ctx->dataMutex, 50 / portTICK_PERIOD_MS) == pdTRUE) {
+            if (_ctx->dataMutex && xSemaphoreTake(_ctx->dataMutex, 50 / portTICK_PERIOD_MS) == pdTRUE) {
                 th->lastSeen[i] = now;
                 th->wasValid[i] = true;
 
@@ -450,10 +470,13 @@ void PresenceService::processRadarData(unsigned long now) {
                 else if (spd < 80) an->moveClass[i] = MoveClass::WALKING;
                 else               an->moveClass[i] = MoveClass::RUNNING;
 
-                // Dwell time in polygon zones
+                // Dwell time in polygon zones (respect day/night profile mask)
+                uint8_t prof2 = _ctx->currentProfile ? *(_ctx->currentProfile) : 0x03;
                 bool nowInPoly = false;
                 for (uint8_t p = 0; p < *(_ctx->polyCount); p++) {
-                    if (_ctx->polygons[p].enabled && isPointInPolygon(t.x, t.y, _ctx->polygons[p])) {
+                    if (!_ctx->polygons[p].enabled) continue;
+                    if (_ctx->polygonMasks && !(_ctx->polygonMasks[p] & prof2)) continue;
+                    if (isPointInPolygon(t.x, t.y, _ctx->polygons[p])) {
                         nowInPoly = true; break;
                     }
                 }
@@ -492,7 +515,7 @@ void PresenceService::processRadarData(unsigned long now) {
                 validCount++; // Count persisted target
             } else {
                 // Target definitely lost/expired
-                if (xSemaphoreTake(_ctx->dataMutex, 20 / portTICK_PERIOD_MS) == pdTRUE) {
+                if (_ctx->dataMutex && xSemaphoreTake(_ctx->dataMutex, 20 / portTICK_PERIOD_MS) == pdTRUE) {
                     _ctx->targetHistory->wasValid[i] = false;
                     xSemaphoreGive(_ctx->dataMutex);
                 }
@@ -532,7 +555,7 @@ void PresenceService::handleTamperDetection(uint8_t validCount, bool* currentTar
         float sx = 0, sy = 0;
         bool wasValid = false;
         
-        if (xSemaphoreTake(_ctx->dataMutex, 20 / portTICK_PERIOD_MS) == pdTRUE) {
+        if (_ctx->dataMutex && xSemaphoreTake(_ctx->dataMutex, 20 / portTICK_PERIOD_MS) == pdTRUE) {
              sx = _ctx->targetHistory->smoothX[i];
              sy = _ctx->targetHistory->smoothY[i];
              wasValid = _ctx->targetHistory->wasValid[i];
@@ -727,30 +750,39 @@ void PresenceService::loadBlackoutZones() {
 
 void PresenceService::updateVariance(int idx, int16_t x, int16_t y) {
     TargetHistory* th = _ctx->targetHistory;
-    
+
     // Add to ring buffer
     th->posXHistory[idx][th->historyIdx[idx]] = x;
     th->posYHistory[idx][th->historyIdx[idx]] = y;
     th->historyIdx[idx] = (th->historyIdx[idx] + 1) % 10;
-    
-    // Calculate Mean
+    if (th->varSamples[idx] < 10) th->varSamples[idx]++;
+
+    // Použij pouze tolik vzorků, kolik jich reálně máme (cold-start fix — předtím
+    // se 10dílá od první detekce, falešně podhodnotila variance → falešný ghost)
+    uint8_t n = th->varSamples[idx];
+    if (n < 3) {
+        // Nedostatek dat — nech vysokou variance, aby cíl nebyl předčasně označen jako ghost
+        th->variance[idx] = 1000.0f;
+        return;
+    }
+
+    float invN = 1.0f / (float)n;
     float meanX = 0, meanY = 0;
-    for(int k=0; k<10; k++) { 
-        meanX += th->posXHistory[idx][k]; 
-        meanY += th->posYHistory[idx][k]; 
+    for(uint8_t k=0; k<n; k++) {
+        meanX += th->posXHistory[idx][k];
+        meanY += th->posYHistory[idx][k];
     }
-    meanX /= 10.0; 
-    meanY /= 10.0;
-    
-    // Calculate Variance (Standard Deviation squared)
+    meanX *= invN;
+    meanY *= invN;
+
     float varSum = 0;
-    for(int k=0; k<10; k++) { 
-        varSum += (pow(th->posXHistory[idx][k] - meanX, 2) + pow(th->posYHistory[idx][k] - meanY, 2)); 
+    for(uint8_t k=0; k<n; k++) {
+        float dx = th->posXHistory[idx][k] - meanX;
+        float dy = th->posYHistory[idx][k] - meanY;
+        varSum += dx*dx + dy*dy;
     }
-    
-    // Store as "Motion Entropy" or Variance
-    // We normalize slightly to make numbers manageable
-    th->variance[idx] = sqrt(varSum / 10.0); // Actually using Standard Deviation for intuitive mm scale
+
+    th->variance[idx] = sqrtf(varSum * invN);
 }
 
 void PresenceService::updateAdaptiveFilter(unsigned long now) {

@@ -20,6 +20,15 @@ void ConfigManager::load() {
     loadPref("bk_pass", _config.backup_pass, sizeof(_config.backup_pass));
 
     _config.mqtt_enabled = _prefs.getBool("mqtt_en", true);
+#ifdef MQTTS_ENABLED
+    if (_prefs.isKey("mqtt_tls")) {
+        _config.mqtt_tls = _prefs.getBool("mqtt_tls", true);
+    } else {
+        _config.mqtt_tls = String(_config.mqtt_port).toInt() == MQTTS_PORT;
+    }
+#else
+    _config.mqtt_tls = false;
+#endif
     _config.led_enabled = _prefs.getBool("led_en", true);
     _config.startup_led_sec = _prefs.getUInt("led_start", 120);
 
@@ -32,6 +41,20 @@ void ConfigManager::load() {
     loadPref("sched_arm", _config.sched_arm_time, sizeof(_config.sched_arm_time));
     loadPref("sched_disarm", _config.sched_disarm_time, sizeof(_config.sched_disarm_time));
     _config.auto_arm_minutes = _prefs.getUShort("auto_arm_min", 0);
+    loadPref("night_start", _config.night_start_time, sizeof(_config.night_start_time));
+    loadPref("night_end", _config.night_end_time, sizeof(_config.night_end_time));
+
+    // Native LD2450 region filter (cmd 0xC2)
+    _config.region_filter_mode = (uint8_t)_prefs.getUChar("rf_mode", 0);
+    if (_prefs.isKey("rf_zones")) {
+        size_t got = _prefs.getBytes("rf_zones",
+                                     _config.region_filter_zones,
+                                     sizeof(_config.region_filter_zones));
+        if (got != sizeof(_config.region_filter_zones)) {
+            // Korupce / neúplný blob — vynuluj
+            memset(_config.region_filter_zones, 0, sizeof(_config.region_filter_zones));
+        }
+    }
 
     // Persist defaults to NVS on first boot (prevents NOT_FOUND errors)
     if (!_prefs.isKey("mqtt_server")) {
@@ -58,6 +81,7 @@ void ConfigManager::save() {
     _prefs.putString("bk_pass", _config.backup_pass);
 
     _prefs.putBool("mqtt_en", _config.mqtt_enabled);
+    _prefs.putBool("mqtt_tls", _config.mqtt_tls);
     _prefs.putBool("led_en", _config.led_enabled);
     _prefs.putUInt("led_start", _config.startup_led_sec);
 
@@ -68,6 +92,13 @@ void ConfigManager::save() {
     _prefs.putString("sched_arm", _config.sched_arm_time);
     _prefs.putString("sched_disarm", _config.sched_disarm_time);
     _prefs.putUShort("auto_arm_min", _config.auto_arm_minutes);
+    _prefs.putString("night_start", _config.night_start_time);
+    _prefs.putString("night_end", _config.night_end_time);
+
+    _prefs.putUChar("rf_mode", _config.region_filter_mode);
+    _prefs.putBytes("rf_zones",
+                    _config.region_filter_zones,
+                    sizeof(_config.region_filter_zones));
 
     Serial.println("[CONFIG] Configuration saved to NVS");
 }

@@ -30,7 +30,7 @@ void MQTTOfflineBuffer::push(const char* topic, const char* payload) {
         _head = (_head + 1) % MQTT_OFB_CAPACITY;
     }
 
-    saveToDisk();
+    _dirty = true;  // saveToDisk() proběhne v update() max 1x za 30s
     Serial.printf("[MQTTOfB] Buffered [%u/%u]: %s\n", _count, MQTT_OFB_CAPACITY, topic);
 }
 
@@ -46,7 +46,22 @@ void MQTTOfflineBuffer::consume() {
     if (_count == 0) return;
     _head = (_head + 1) % MQTT_OFB_CAPACITY;
     _count--;
+    _dirty = true;
+}
+
+void MQTTOfflineBuffer::update() {
+    if (!_dirty) return;
+    if (millis() - _lastSave < SAVE_INTERVAL_MS) return;
     saveToDisk();
+    _lastSave = millis();
+    _dirty = false;
+}
+
+void MQTTOfflineBuffer::flushNow() {
+    if (!_dirty) return;
+    saveToDisk();
+    _lastSave = millis();
+    _dirty = false;
 }
 
 void MQTTOfflineBuffer::loadFromDisk() {

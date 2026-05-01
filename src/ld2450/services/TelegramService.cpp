@@ -13,9 +13,8 @@ TelegramService::TelegramService() : _bot(nullptr), _enabled(false), _connected(
 void TelegramService::begin(Preferences* prefs) {
     _prefs = prefs;
 
-    // Force disabled — fusion service handles all Telegram
-    _enabled = false;
-    _prefs->putBool("tg_direct_en", false);
+    // Respektuj NVS — výchozí false, ale uživatel může v UI zapnout.
+    _enabled = _prefs->getBool("tg_direct_en", false);
     String token = _prefs->getString("tg_token", TELEGRAM_TOKEN_DEFAULT);
     String chatId = _prefs->getString("tg_chat", TELEGRAM_CHAT_ID_DEFAULT);
 
@@ -39,7 +38,8 @@ void TelegramService::begin(Preferences* prefs) {
 
         _sendQueue = xQueueCreate(QUEUE_SIZE, sizeof(TelegramQueueItem));
         if (_sendQueue) {
-            xTaskCreatePinnedToCore(telegramTaskFunc, "tg_task", 8192, this, 1, &_taskHandle, 0);
+            // 16 KB stack — mbedtls SSL handshake si bere 8-10 KB, 8KB by overflowoval
+            xTaskCreatePinnedToCore(telegramTaskFunc, "tg_task", 16384, this, 1, &_taskHandle, 0);
             Serial.println("[Telegram] Background task started");
         }
 
@@ -147,12 +147,12 @@ void TelegramService::processCommand(const String& command, const String& chatId
     if (cmd == "/start" || cmd == "/help") {
         sendMessage("*LD2450 Security Node*\n\n"
                      "/status - System status\n"
-                     "/arm - Arm alarm\n"
+                     "/arm - Arm alarm (with exit delay)\n"
                      "/disarm - Disarm alarm\n"
-                     "/arm_now - Arm immediately\n"
-                     "/mute - Mute 10m\n"
-                     "/unmute - Enable notifications\n"
-                     "/restart - Restart");
+                     "/arm_now - Immediate arm\n"
+                     "/mute - Mute notifications for 10 min\n"
+                     "/unmute - Re-enable notifications\n"
+                     "/restart - Reboot device");
     }
     else if (cmd == "/arm") {
         if (_secMon) _secMon->setArmed(true, false);
@@ -200,7 +200,7 @@ void TelegramService::processCommand(const String& command, const String& chatId
     }
     else if (cmd == "/unmute") {
         _muteDuration = 0;
-        sendMessage("Notifications enabled.");
+        sendMessage("Notifications re-enabled.");
     }
     else {
         sendMessage("Unknown command. Try /help");

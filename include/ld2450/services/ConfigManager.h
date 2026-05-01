@@ -17,6 +17,7 @@ struct SystemConfig {
     char backup_ssid[33] = "";
     char backup_pass[65] = "";
     bool mqtt_enabled = true;
+    bool mqtt_tls = false;
     bool led_enabled = true;
     uint16_t startup_led_sec = 120;
     // LD2450-specific (no gate config, but zone config)
@@ -27,6 +28,14 @@ struct SystemConfig {
     char sched_arm_time[6] = "";
     char sched_disarm_time[6] = "";
     uint16_t auto_arm_minutes = 0;
+    // Day/Night zone profile schedule (HH:MM). Empty = always day profile.
+    char night_start_time[6] = "";
+    char night_end_time[6] = "";
+
+    // Native LD2450 region filter (cmd 0xC2). Mode 0=disabled, 1=detect-only, 2=exclude.
+    // Pole drží 3 zóny × {x1,y1,x2,y2} → 12 int16. Ukládáno do NVS jako blob "rf_zones".
+    uint8_t region_filter_mode = 0;
+    int16_t region_filter_zones[12] = {0};
 };
 
 class ConfigManager {

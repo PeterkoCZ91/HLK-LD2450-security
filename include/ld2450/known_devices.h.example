@@ -1,17 +1,23 @@
 #ifndef KNOWN_DEVICES_H
 #define KNOWN_DEVICES_H
 
+// =========================================================================
+// Copy this file to `known_devices.h` and add your own MAC → identity rows.
+// At boot the firmware looks up its own MAC; if found, it uses the matching
+// MQTT client_id and mDNS hostname. Otherwise a fallback id is generated
+// from the last 3 bytes of the MAC (e.g. ld2450_xxxxxx).
+// `known_devices.h` is gitignored.
+// =========================================================================
+
 struct DeviceIdentity {
-    const char* mac;       // MAC address (lowercase)
+    const char* mac;       // MAC address (lowercase, colon-separated)
     const char* id;        // MQTT Client ID
     const char* hostname;  // mDNS / WiFi Hostname
 };
 
-// Add your ESP32 devices here. MAC is read at boot and matched against this list.
-// If no match is found, the device uses a default ID based on its MAC address.
 const DeviceIdentity KNOWN_DEVICES[] = {
-    { "aa:bb:cc:dd:ee:f1", "ld2450_living_room", "sensor-ld2450-living-room" },
-    { "aa:bb:cc:dd:ee:f2", "ld2450_hallway",     "sensor-ld2450-hallway" },
+    // { "aa:bb:cc:dd:ee:01", "ld2450_living_room", "ld2450-living-room" },
+    // { "aa:bb:cc:dd:ee:02", "ld2450_hallway",     "ld2450-hallway" },
 };
 
 const int KNOWN_DEVICE_COUNT = sizeof(KNOWN_DEVICES) / sizeof(KNOWN_DEVICES[0]);

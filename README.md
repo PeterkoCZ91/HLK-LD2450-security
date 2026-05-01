@@ -3,12 +3,12 @@
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange?logo=platformio)](https://platformio.org/)
 [![ESP32](https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue?logo=espressif)](https://www.espressif.com/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-5.5.3-blue)]()
+[![Version](https://img.shields.io/badge/Version-5.7.5-blue)]()
 
-**Multi-target intrusion detection system** built on ESP32 + HLK-LD2450 24 GHz mmWave radar. Real-time 2D target tracking with Kalman filtering, polygon detection zones, ghost suppression via AI noise learning, full alarm state machine, Home Assistant integration, Telegram bot, and a dark-mode web dashboard with live radar map. No cloud required.
+**Multi-target intrusion detection system** built on ESP32 + HLK-LD2450 24 GHz mmWave radar. Real-time 2D target tracking with Kalman filtering, polygon detection zones, ghost suppression via background calibration, full alarm state machine, Home Assistant integration, Telegram bot, and a dark-mode bilingual (CS/EN) web dashboard with live radar map. No cloud required.
 
 > [!TIP]
-> **New in v5.5** -- Extended Kalman Filter tracking, blackout zone drawing on the radar map, and reliability improvements ported from the LD2412 security audit.
+> **New in v5.7** -- Native hardware region filter (radar-side cmd 0xC2), day/night zone profiles with per-zone activity masks, bilingual web UI (CS/EN), regression test suite for the radar parser (16 unit tests), and a refactored route layer for cleaner endpoint code.
 
 ---
 
@@ -160,11 +160,14 @@ States: **DISARMED** -> **ARMING** (exit delay) -> **ARMED** -> **PENDING** (ent
 | Feature | Description |
 |---------|-------------|
 | Alarm state machine | 5 states with configurable entry/exit delays |
-| Polygon detection zones | 2 user-defined polygon zones with up to 8 vertices each |
+| Polygon detection zones | Up to 5 user-defined polygon zones with up to 8 vertices each |
 | Blackout zones | Up to 5 rectangular exclusion areas (HVAC, furniture, windows) |
+| Day / night profiles | HH:MM switch times; each polygon and blackout zone carries a per-profile mask (day-only, night-only, or both) |
 | Anti-masking | Detects sensor obstruction (prolonged zero targets when armed) |
 | Loitering detection | Alert when target lingers beyond timeout |
+| Entry / exit counter | Virtual tripwire line with directional in/out counting |
 | RSSI anomaly detection | WiFi jamming alert with baseline tracking |
+| Scheduled arm / disarm | Daily HH:MM auto-arm/disarm + auto-arm after inactivity timeout |
 | Auto-rearm | Re-arms after trigger timeout (default 15 min) |
 | Siren/strobe output | Optional GPIO for audible/visual alarm |
 | Disarm reminder | Notification if system left disarmed |
@@ -177,7 +180,8 @@ States: **DISARMED** -> **ARMING** (exit delay) -> **ARMED** -> **PENDING** (ent
 | Extended Kalman Filter | EKF2D per target for smooth trajectory estimation |
 | Target association | Hungarian-algorithm-inspired matching across frames |
 | Ghost detection | Static targets exceeding timeout classified as ghosts |
-| AI noise learning | 80x80 grid noise map learns static reflectors (1h calibration) |
+| Background calibration | 80x80 grid noise map learns static reflectors (~1 h calibration) |
+| Hardware region filter | Native LD2450 cmd 0xC2: 3 rectangular zones in include/exclude mode, filtered radar-side before UART |
 | Configurable filtering | Min target size, static energy threshold, motion/position thresholds |
 | Live radar map | Real-time 2D visualization with trails, zones, and noise overlay |
 
@@ -187,10 +191,11 @@ States: **DISARMED** -> **ARMING** (exit delay) -> **ARMED** -> **PENDING** (ent
 |---------|-------------|
 | MQTT + Home Assistant | Auto-discovery, all entities created automatically |
 | MQTTS (TLS) | Optional encrypted MQTT with certificate expiry monitoring |
+| MQTT offline buffer | LittleFS-backed ring buffer (30 messages), survives reboot, auto-replay on reconnect |
 | Telegram bot | 7 commands: arm, disarm, arm_now, status, mute, unmute, restart |
 | BLE configuration | NimBLE peripheral for mobile setup (passkey-protected) |
 | WiFi failover | Backup SSID with automatic reconnection |
-| OTA updates | Web-based and ArduinoOTA firmware upload |
+| OTA updates | Web-based and ArduinoOTA firmware upload, optional MD5 hash check |
 | Dead Man's Switch | Auto-restart if no MQTT publish in 60 min |
 
 ### :bar_chart: Diagnostics
@@ -209,7 +214,8 @@ States: **DISARMED** -> **ARMING** (exit delay) -> **ARMED** -> **PENDING** (ent
 | Feature | Description |
 |---------|-------------|
 | Web dashboard | Responsive dark/light UI with live radar map and SSE updates |
-| REST API | Full config, telemetry, alarm, zone, and OTA endpoints |
+| Bilingual UI | Built-in Czech / English toggle, persisted in localStorage |
+| REST API | Full config, telemetry, alarm, zone, schedule, and OTA endpoints |
 | Config backup/restore | JSON export/import of all settings |
 | mDNS | `http://hostname.local/` access |
 
@@ -219,24 +225,24 @@ States: **DISARMED** -> **ARMING** (exit delay) -> **ARMED** -> **PENDING** (ent
 
 Dark-mode responsive web UI accessible at `http://<device-ip>/`.
 
-| Dashboard + Radar Map | Alarm & Schedule | Network |
+| Radar / Dashboard | Alarm & Schedule | Zones & Region Filter |
 |:---:|:---:|:---:|
-| ![Dashboard](docs/screenshots/dashboard-radar.png) | ![Alarm](docs/screenshots/alarm-settings.png) | ![Network](docs/screenshots/network.png) |
+| ![Radar](docs/screenshots/01-radar.png) | ![Alarm](docs/screenshots/02-alarm-schedule.png) | ![Zones](docs/screenshots/03-zones-regionfilter.png) |
 
-| Zones | System / OTA |
-|:---:|:---:|
-| ![Zones](docs/screenshots/zones.png) | ![System](docs/screenshots/system-ota.png) |
+| Network | Event Log | System / OTA |
+|:---:|:---:|:---:|
+| ![Network](docs/screenshots/04-network.png) | ![Log](docs/screenshots/05-events.png) | ![System](docs/screenshots/06-system.png) |
 
 **Tabs:**
 
 - **Radar** -- detection width/range, rotation, filtering thresholds, hostname
-- **Alarm** -- entry/exit delays, anti-masking, loitering, heartbeat, RSSI security
-- **Zones** -- polygon zone editor (click-to-add), blackout zone drawing and manual entry
+- **Alarm** -- entry/exit delays, anti-masking, loitering, heartbeat, RSSI security, scheduled arm/disarm, day/night profile times
+- **Zones** -- polygon zone editor (click-to-add), blackout zones with per-profile masks, virtual tripwire, hardware region filter (cmd 0xC2)
 - **Network** -- MQTT, WiFi backup, Telegram, credentials
 - **Log** -- event history with clear function
-- **System** -- AI noise learning, OTA firmware upload, config backup/restore
+- **System** -- background calibration, OTA firmware upload, config backup/restore, BLE radio toggle
 
-> The entire UI is embedded as a single PROGMEM string. No external files, no SD card.
+> The entire UI is embedded as a single PROGMEM string. No external files, no SD card. Switch between Czech and English via the language button next to the connection icons.
 
 ---
 
@@ -274,15 +280,20 @@ Create a bot via [@BotFather](https://t.me/BotFather), add token and chat ID to 
 | `/api/security/config` | GET/POST | Anti-masking, loitering, heartbeat, RSSI thresholds |
 | `/api/events` | GET | Event log (JSON) |
 | `/api/events/clear` | POST | Clear event log |
-| `/api/blackout/add` | POST | Add blackout zone |
+| `/api/blackout/add` | POST | Add blackout zone (optional `mask` for day/night) |
 | `/api/blackout/delete` | POST | Delete blackout zone |
-| `/api/blackout/update` | POST | Enable/disable blackout zone |
+| `/api/blackout/update` | POST | Enable/disable blackout zone, change `mask` |
 | `/api/polygon/add_current` | POST | Add current target position as polygon point |
-| `/api/polygon/set` | POST | Set/clear polygon zone |
-| `/api/noise/start` | POST | Start noise learning |
+| `/api/polygon/set` | POST | Set/clear polygon zone (optional `mask` for day/night) |
+| `/api/polygon/mask` | POST | Update day/night mask of a polygon zone |
+| `/api/zones/region_filter` | GET/POST | Hardware region filter (cmd 0xC2): mode + 3 rectangular zones |
+| `/api/schedule` | GET/POST | Daily arm/disarm times, auto-arm minutes, day/night profile times |
+| `/api/tripwire` | POST | Configure entry/exit virtual tripwire |
+| `/api/noise/start` | POST | Start background calibration |
 | `/api/noise/stop` | POST | Stop and save noise map |
-| `/api/noise/toggle` | POST | Toggle noise filter |
+| `/api/noise/toggle` | POST | Toggle background noise filter |
 | `/api/noisemap` | GET | Raw noise map (binary, 80x80 uint16) |
+| `/api/radar/bluetooth` | POST | Toggle LD2450 module BLE radio (security hardening) |
 | `/api/ota` | POST | Web OTA firmware upload |
 | `/api/config/export` | GET | Export config as JSON |
 | `/api/config/import` | POST | Import config from JSON |
@@ -316,30 +327,42 @@ Prefix: `security/<device_id>/`
 
 ```
 src/ld2450/
- +-- main_ld2450.cpp           Entry point, WiFi, OTA, service orchestration
+ +-- main_ld2450.cpp           Entry point, WiFi, OTA, service orchestration, day/night scheduler
  +-- services/
-      +-- LD2450Service.cpp    Radar driver (UART parser, 3-target extraction)
-      +-- PresenceService.cpp  Presence logic, noise learning, WiFi reconnect
-      +-- SecurityMonitor.cpp  Alarm state machine, tamper detection, health
-      +-- MQTTService.cpp      HA auto-discovery, TLS, publish/subscribe
-      +-- WebService.cpp       REST API + SSE + OTA handler (~40 endpoints)
-      +-- TelegramService.cpp  Bot polling + command handler
-      +-- BluetoothService.cpp NimBLE peripheral for mobile config
-      +-- ConfigManager.cpp    NVS persistence layer
-      +-- EventLog.cpp         LittleFS event ring buffer
+ |    +-- LD2450Service.cpp    Radar driver (UART task, 3-target extraction, region filter cmd 0xC2)
+ |    +-- PresenceService.cpp  Presence logic, calibration, WiFi reconnect, profile-aware zone filter
+ |    +-- SecurityMonitor.cpp  Alarm state machine, tamper detection, health, scheduled arm/disarm
+ |    +-- MQTTService.cpp      HA auto-discovery, TLS, publish/subscribe
+ |    +-- MQTTOfflineBuffer.cpp LittleFS ring buffer for offline MQTT messages
+ |    +-- WebService.cpp       Auth, SSE, route registration
+ |    +-- TelegramService.cpp  Bot polling + command handler
+ |    +-- BluetoothService.cpp NimBLE peripheral for mobile config
+ |    +-- ConfigManager.cpp    NVS persistence layer
+ |    +-- EventLog.cpp         LittleFS event ring buffer
+ +-- web/                       REST API endpoints split by topic
+      +-- network_routes.cpp    MQTT, WiFi, Telegram, auth
+      +-- security_routes.cpp   Alarm, anti-masking, loitering, PIN code
+      +-- schedule_routes.cpp   Daily schedule, day/night profile, tripwire, polygons
+      +-- system_routes.cpp     Restart, OTA, BLE toggle, calibration, config import/export
+      +-- telemetry_routes.cpp  /api/telemetry, /api/diagnostics, /api/debug/radar
+      +-- zone_routes.cpp       Blackout zones, region filter, polygon masks
 
 include/ld2450/
  +-- constants.h               All timing, thresholds, pin defaults
  +-- types.h                   Data structures, enums, AppContext
- +-- web_interface.h           Embedded HTML/CSS/JS dashboard
+ +-- web_interface.h           Embedded HTML/CSS/JS dashboard with CS/EN i18n
  +-- utils/
       +-- EKF2D.h              2D Extended Kalman Filter [x,y,vx,vy]
-      +-- Kalman.h             1D Kalman filter
-      +-- TargetAssociation.h  Cross-frame target matching
+      +-- TargetAssociation.h  Cross-frame target matching (Hungarian-inspired)
+      +-- ld2450_frame.h       Pure parsing helpers, shared with native unit tests
 
 include/
  +-- secrets.h.example         Credential template
  +-- ld2450/known_devices.h.example  Multi-device MAC mapping template
+
+test/
+ +-- test_parser/test_parser.cpp  16 host-side unit tests for the radar parser
+                                  (run with `pio test -e native`)
 ```
 
 ### Data Flow
@@ -406,9 +429,9 @@ The LD2450 radar module has its own firmware, separate from the ESP32. You can c
 
 - Web UI is a PROGMEM string -- editing requires firmware rebuild
 - No multi-sensor coordination yet (each node is independent)
-- Noise learning requires ~1 hour in an empty room
+- Background calibration requires ~1 hour in an empty room
 - Blackout zones are rectangular only (polygons for detection zones only)
-- No persistent MQTT offline buffer (unlike LD2412 version)
+- Day/night profile applies only to blackout zones; polygon zones are active in both profiles
 
 </details>
 
@@ -418,11 +441,12 @@ The LD2450 radar module has its own firmware, separate from the ESP32. You can c
 | Aspect | LD2450 (this project) | [LD2412-security](https://github.com/PeterkoCZ91/HLK-LD2412-security) |
 |--------|:---------------------|:------------------------------------------------------------------|
 | Targets | 3 simultaneous with X/Y/speed | 1 with distance + energy |
-| Detection | 2D polygon zones | 1D distance-based zones (16 zones) |
+| Detection | 2D polygon zones (5) + hardware region filter (3 rects) | 1D distance-based zones (16 zones) |
 | Tracking | Kalman filter, trails, radar map | Approach tracker, direction inference |
-| Ghost handling | AI noise map (80x80 grid) | Static reflector learning |
-| Unit tests | -- | 41 tests |
-| MQTT offline buffer | -- | LittleFS queue |
+| Ghost handling | Background calibration map (80x80 grid) | Static reflector learning |
+| Day / night profiles | :white_check_mark: per-zone HH:MM masks | -- |
+| Unit tests | 16 parser tests | 41 tests |
+| MQTT offline buffer | :white_check_mark: LittleFS queue | LittleFS queue |
 | BLE config | :white_check_mark: NimBLE | -- |
 | Engineering mode | N/A (LD2450 has no gates) | Per-gate energy visualization |
 
@@ -438,14 +462,18 @@ The two projects share the same alarm state machine, security architecture, and 
 |---------|--------|-------------|
 | Multi-sensor fusion | :bulb: Planned | LD2450 + LD2412 + WiFi CSI cross-validation via MQTT |
 | Camera PTZ tracking | :bulb: Planned | Steer PTZ camera to follow radar targets |
-| Scheduled arm/disarm | :white_check_mark: Done | Time-based auto arm/disarm + inactivity auto-arm (v5.5.3) |
-| MQTT offline buffer | :white_check_mark: Done | LittleFS ring buffer, 30 messages, survives reboot (v5.5.3) |
-| Entry/exit counter | :white_check_mark: Done | Virtual tripwire line with directional counting (v5.5.3) |
-| Movement classification | :white_check_mark: Done | Standing/walking/running per target (v5.5.3) |
-| Zone dwell time | :white_check_mark: Done | Per-target time spent in polygon zones (v5.5.3) |
+| Hardware region filter | :white_check_mark: Done | LD2450 cmd 0xC2: 3 rectangular zones, radar-side filtering (v5.7) |
+| Day / night zone profiles | :white_check_mark: Done | Per-zone HH:MM masks for day-only, night-only, or both (v5.7) |
+| Bilingual web UI | :white_check_mark: Done | Czech / English toggle, persisted in localStorage (v5.7) |
+| Parser regression tests | :white_check_mark: Done | 16 host-side unit tests (`pio test -e native`) (v5.7) |
+| Scheduled arm/disarm | :white_check_mark: Done | Time-based auto arm/disarm + inactivity auto-arm (v5.5) |
+| MQTT offline buffer | :white_check_mark: Done | LittleFS ring buffer, 30 messages, survives reboot (v5.5) |
+| Entry/exit counter | :white_check_mark: Done | Virtual tripwire line with directional counting (v5.5) |
+| Movement classification | :white_check_mark: Done | Standing/walking/running per target (v5.5) |
+| Zone dwell time | :white_check_mark: Done | Per-target time spent in polygon zones (v5.5) |
 | Kalman filter tracking | :white_check_mark: Done | EKF2D per target (v5.4) |
 | Blackout zone drawing | :white_check_mark: Done | Draw on radar map (v5.3) |
-| AI noise learning | :white_check_mark: Done | 80x80 noise map (v5.2) |
+| Background calibration | :white_check_mark: Done | 80x80 noise map (v5.2) |
 | Security audit port | :white_check_mark: Done | 13 fixes from LD2412 audit (v5.5) |
 
 ---
@@ -519,6 +547,15 @@ pio run -e ld2450_prod --target upload
 |-------------|-------|--------|----------|
 | `ld2450_lab` | ESP32-WROOM | USB | Development, debug |
 | `ld2450_prod` | ESP32-WROOM | OTA | Production deployment |
+| `native` | host | -- | Parser regression tests (`pio test -e native`) |
+
+### Parser Unit Tests
+
+```bash
+pio test -e native
+```
+
+The `native` environment compiles the radar frame parser against Unity test framework and runs 16 host-side regression tests covering: valid CSRON frames (single/multi target), origin-target with non-zero resolution (HLK firmware v2.14), trailing garbage handling, header-byte-inside-payload anti-false-match, and back-to-back frame parsing. No ESP32 hardware needed.
 
 ### Multi-Device OTA
 
@@ -585,8 +622,9 @@ Evolved from a simple presence detector into a full multi-target security system
 |-------|----------|-------|
 | Foundation | v1.x--v3.x | Basic presence, MQTT, web UI |
 | Multi-target | v4.x | Target tracking, polygon zones, radar map |
-| Intelligence | v5.0--v5.2 | Kalman filter, ghost detection, AI noise learning |
+| Intelligence | v5.0--v5.2 | Kalman filter, ghost detection, background calibration |
 | Security hardening | v5.3--v5.5 | Blackout zones, BLE config, LD2412 audit port, ESP32-C6 |
+| Refinement | v5.6--v5.7 | Hardware region filter, day/night profiles, bilingual UI, parser regression tests |
 
 See [CHANGELOG.md](CHANGELOG.md) for detailed version history.
 

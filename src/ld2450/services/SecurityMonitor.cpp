@@ -11,6 +11,12 @@ void SecurityMonitor::begin(MQTTService* mqttService, EventLog* eventLog, Prefer
     _lastRSSI = WiFi.RSSI();
     _baselineRSSI = _lastRSSI;
     _startTime = millis();
+    if (!_stateMutex) {
+        _stateMutex = xSemaphoreCreateMutex();
+        if (!_stateMutex) {
+            Serial.println("[SecMon] FATAL: state mutex create failed");
+        }
+    }
     Serial.printf("[SecMon] Initialized. Baseline RSSI: %ld dBm\n", _baselineRSSI);
 }
 
@@ -23,24 +29,32 @@ void SecurityMonitor::update() {
         checkSystemHealth();
     }
 
-    // Exit delay: ARMING -> ARMED
+    // Exit delay: ARMING -> ARMED  (chráněno mutexem proti Telegram setArmed)
+    const char* transitionMsg = nullptr;
+    if (_stateMutex) xSemaphoreTake(_stateMutex, portMAX_DELAY);
     if (_alarmState == SecurityState::ARMING && now - _exitDelayStart >= _exitDelay) {
         _alarmState = SecurityState::ARMED;
         Serial.println("[SecMon] ARMED (exit delay expired)");
-        triggerAlert(EVT_SECURITY, "ARMED - exit delay completed");
+        transitionMsg = "ARMED - exit delay completed";
     }
-
     // TRIGGERED timeout -> auto-silence
+    bool fireSilenceMsg = false;
+    const char* silenceMsg = nullptr;
     if (_alarmState == SecurityState::TRIGGERED && _triggerTimeout > 0 && now - _triggerStartTime >= _triggerTimeout) {
         deactivateSiren();
         if (_autoRearm) {
             _alarmState = SecurityState::ARMED;
-            triggerAlert(EVT_SECURITY, "Alarm auto-silenced, re-armed");
+            silenceMsg = "Alarm auto-silenced, re-armed";
         } else {
             _alarmState = SecurityState::DISARMED;
-            triggerAlert(EVT_SECURITY, "Alarm auto-silenced, disarmed");
+            silenceMsg = "Alarm auto-silenced, disarmed";
         }
+        fireSilenceMsg = true;
     }
+    if (_stateMutex) xSemaphoreGive(_stateMutex);
+
+    if (transitionMsg) triggerAlert(EVT_SECURITY, transitionMsg);
+    if (fireSilenceMsg && silenceMsg) triggerAlert(EVT_SECURITY, silenceMsg);
 
     // Disarm reminder
     if (_alarmState == SecurityState::DISARMED && _disarmReminderEnabled && _lastPresenceWhileDisarmed > 0) {
@@ -63,24 +77,34 @@ void SecurityMonitor::update() {
 
 void SecurityMonitor::setArmed(bool armed, bool immediate, bool homeMode) {
     unsigned long now = millis();
+
+    // Mutex chrání proti cross-core race (Telegram task vs loop task).
+    // Bez něj by NVS putBool a state mutace kolidovaly.
+    if (_stateMutex) xSemaphoreTake(_stateMutex, portMAX_DELAY);
+
+    bool stateChanged = false;
+    const char* alertMsg = nullptr;
+
     if (armed) {
         // Re-arm guard: reject if alarm is in PENDING or TRIGGERED state
         if (_alarmState == SecurityState::PENDING || _alarmState == SecurityState::TRIGGERED) {
             Serial.println("[SecMon] Re-arm rejected: alarm active (PENDING/TRIGGERED)");
+            if (_stateMutex) xSemaphoreGive(_stateMutex);
             return;
         }
         _homeMode = homeMode;
         if (immediate) {
             _alarmState = SecurityState::ARMED;
-            triggerAlert(EVT_SECURITY, homeMode ? "ARMED HOME (immediate)" : "ARMED AWAY (immediate)");
+            alertMsg = homeMode ? "ARMED HOME (immediate)" : "ARMED AWAY (immediate)";
         } else {
             _alarmState = SecurityState::ARMING;
             _exitDelayStart = now;
-            triggerAlert(EVT_SECURITY, homeMode ? "ARMING HOME - exit delay started" : "ARMING AWAY - exit delay started");
+            alertMsg = homeMode ? "ARMING HOME - exit delay started" : "ARMING AWAY - exit delay started";
         }
         _lastPresenceWhileDisarmed = 0;
         _presenceWhileDisarmedStart = 0;
         _lastDisarmReminder = 0;
+        stateChanged = true;
     } else {
         SecurityState prev = _alarmState;
         if (prev == SecurityState::TRIGGERED) deactivateSiren();
@@ -92,13 +116,21 @@ void SecurityMonitor::setArmed(bool armed, bool immediate, bool homeMode) {
         _presenceWhileDisarmedStart = 0;
         _lastDisarmReminder = 0;
         if (prev != SecurityState::DISARMED) {
-            triggerAlert(EVT_SECURITY, "DISARMED");
+            alertMsg = "DISARMED";
+            stateChanged = true;
         }
     }
+
+    if (_stateMutex) xSemaphoreGive(_stateMutex);
+
+    // NVS / MQTT mimo lock — Preferences API je sice non-thread-safe, ale teď se serializuje
+    // pouze přes _stateMutex (volající z Telegram tasku ho čeká také). Drží se tedy invariant
+    // "1 setArmed in flight" — putBool níže je tím chráněno.
     if (_prefs) {
         _prefs->putBool("sec_armed", armed);
         _prefs->putBool("sec_home", homeMode && armed);
     }
+    if (alertMsg) triggerAlert(EVT_SECURITY, alertMsg);
 }
 
 bool SecurityMonitor::isArmed() const {
@@ -165,14 +197,23 @@ void SecurityMonitor::processTargets(uint8_t targetCount, const LD2450Target tar
     }
 
     // Armed logic (home mode ignores normal presence, only tamper triggers)
+    if (_stateMutex) xSemaphoreTake(_stateMutex, portMAX_DELAY);
+    bool fireEntry = false;
+    bool fireTrigger = false;
     if (_alarmState == SecurityState::ARMED && targetCount > 0 && !_homeMode) {
         _alarmState = SecurityState::PENDING;
         _entryDelayStart = now;
-        triggerAlert(EVT_SECURITY, "ENTRY DETECTED - entry delay started");
+        fireEntry = true;
     }
     else if (_alarmState == SecurityState::PENDING && now - _entryDelayStart >= _entryDelay) {
         _alarmState = SecurityState::TRIGGERED;
         _triggerStartTime = now;
+        fireTrigger = true;
+    }
+    if (_stateMutex) xSemaphoreGive(_stateMutex);
+
+    if (fireEntry) triggerAlert(EVT_SECURITY, "ENTRY DETECTED - entry delay started");
+    if (fireTrigger) {
 
         // Build approach forensics summary
         String alertMsg = "ALARM TRIGGERED! Approach log:";
@@ -321,19 +362,23 @@ void SecurityMonitor::triggerAlert(uint8_t eventType, const String& message) {
 
 void SecurityMonitor::recordApproach(uint8_t targetIdx, const LD2450Target& t, uint8_t totalCount) {
     ApproachEntry& e = _approachLog[_approachHead];
-    e.timestamp = millis() / 1000;
+    // Pokud je NTP synchronizováno, ukládáme epoch unix time; jinak fallback uptime sec.
+    // Konzistentní význam s isoTime (oboje walltime, nebo oboje uptime).
+    time_t epoch = time(nullptr);
+    if (epoch > 1700000000) {
+        e.timestamp = (uint32_t)epoch;
+        struct tm ti;
+        localtime_r(&epoch, &ti);
+        strftime(e.isoTime, sizeof(e.isoTime), "%Y-%m-%dT%H:%M:%S", &ti);
+    } else {
+        e.timestamp = millis() / 1000;
+        e.isoTime[0] = '\0';
+    }
     e.x = t.x;
     e.y = t.y;
     e.speed = t.speed;
     e.targetIdx = targetIdx;
     e.targetCount = totalCount;
-
-    struct tm ti;
-    if (getLocalTime(&ti, 0)) {
-        strftime(e.isoTime, sizeof(e.isoTime), "%Y-%m-%dT%H:%M:%S", &ti);
-    } else {
-        e.isoTime[0] = '\0';
-    }
 
     _approachHead = (_approachHead + 1) % APPROACH_LOG_SIZE;
     if (_approachCount < APPROACH_LOG_SIZE) _approachCount++;

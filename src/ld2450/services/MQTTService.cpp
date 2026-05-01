@@ -5,7 +5,7 @@
 // Forward extern for CA cert if it's not in secrets.h (it IS in secrets.h usually)
 // In main it was used as `mqtt_server_ca`. It comes from secrets.h.
 
-MQTTService::MQTTService() : _mqttClient(_espClient) {
+MQTTService::MQTTService() : _mqttClient(_plainClient) {
     // Constructor
 }
 
@@ -13,17 +13,28 @@ void MQTTService::begin(Preferences* prefs, const char* deviceId, NetworkQuality
     _prefs = prefs;
     _netQuality = netQuality;
     strncpy(_deviceId, deviceId, 31);
+    _deviceId[31] = '\0';
     
     // Load Config
     String s_server = _prefs->getString("mqtt_server", MQTT_SERVER_DEFAULT);
     String s_port = _prefs->getString("mqtt_port", "");
     String s_user = _prefs->getString("mqtt_user", MQTT_USER_DEFAULT);
     String s_pass = _prefs->getString("mqtt_pass", MQTT_PASS_DEFAULT);
+    _enabled = _prefs->getBool("mqtt_en", true);
+#ifdef MQTTS_ENABLED
+    if (_prefs->isKey("mqtt_tls")) {
+        _tlsEnabled = _prefs->getBool("mqtt_tls", true);
+    } else {
+        _tlsEnabled = s_port.toInt() == MQTTS_PORT;
+    }
+#else
+    _tlsEnabled = false;
+#endif
 
-    s_server.toCharArray(_server, 40);
+    s_server.toCharArray(_server, sizeof(_server));
     s_port.toCharArray(_port, 6);
-    s_user.toCharArray(_user, 32);
-    s_pass.toCharArray(_pass, 32);
+    s_user.toCharArray(_user, sizeof(_user));
+    s_pass.toCharArray(_pass, sizeof(_pass));
     
     generateTopics();
     setupClient();
@@ -68,26 +79,43 @@ void MQTTService::generateTopics() {
 
 
 void MQTTService::setupClient() {
-    if (strlen(_server) == 0) return;
+    if (!_enabled || strlen(_server) == 0) return;
 
     int portInt;
     if (strlen(_port) > 0) {
         portInt = atoi(_port);
     } else {
-        #ifdef MQTTS_ENABLED
-          portInt = MQTTS_PORT;
-        #else
-          portInt = MQTT_PORT_DEFAULT;
-        #endif
+#ifdef MQTTS_ENABLED
+        portInt = _tlsEnabled ? MQTTS_PORT : MQTT_PORT_DEFAULT;
+#else
+        portInt = MQTT_PORT_DEFAULT;
+#endif
     }
 
     _mqttClient.setBufferSize(512); // Required for HA discovery payloads
 
-    #ifdef MQTTS_ENABLED
-      if (portInt == MQTTS_PORT) {
-          _espClient.setCACert(mqtt_server_ca);
-      }
-    #endif
+#ifdef MQTTS_ENABLED
+    if (_tlsEnabled) {
+        // Validace CA cert obsahu — pokud je placeholder/empty, nepokoušet se TLS handshake
+        // jinak by to skončilo v restart-loopu (DMS) bez šance na zotavení.
+        bool caValid = (mqtt_server_ca != nullptr) &&
+                       (strstr(mqtt_server_ca, "BEGIN CERTIFICATE") != nullptr) &&
+                       (strlen(mqtt_server_ca) > 200);
+        if (caValid) {
+            _secureClient.setCACert(mqtt_server_ca);
+            _mqttClient.setClient(_secureClient);
+        } else {
+            Serial.println("[MQTT] WARNING: CA cert missing/placeholder — falling back to plain TCP");
+            _tlsEnabled = false;
+            // Pokud port byl 8883, ponecháme ho — uživatel pak vidí connect-fail a opraví config.
+            _mqttClient.setClient(_plainClient);
+        }
+    } else {
+        _mqttClient.setClient(_plainClient);
+    }
+#else
+    _mqttClient.setClient(_plainClient);
+#endif
     _mqttClient.setServer(_server, portInt);
 }
 
@@ -96,20 +124,26 @@ void MQTTService::setCallback(MQTT_CALLBACK_SIGNATURE) {
 }
 
 void MQTTService::update() {
-    if (strlen(_server) == 0) return;
-    
+    if (!_enabled || strlen(_server) == 0) return;
+
     if (!_mqttClient.connected()) {
         connect();
     } else {
         _mqttClient.loop();
     }
+
+    // Lazy persistence offline bufferu (chrání flash před wear-outem při flapping MQTT)
+    _offlineBuffer.update();
 }
 
 bool MQTTService::connected() {
-    return _mqttClient.connected();
+    return _enabled && _mqttClient.connected();
 }
 
 bool MQTTService::publish(const char* topic, const char* payload, bool retained) {
+    if (!_enabled) {
+        return false;
+    }
     if (!_mqttClient.connected()) {
         _offlineBuffer.push(topic, payload);
         return false;
@@ -135,6 +169,8 @@ bool MQTTService::publish(const char* topic, const char* payload, bool retained)
 }
 
 void MQTTService::connect() {
+    if (!_enabled) return;
+
     // Exponential backoff
     unsigned long now = millis();
     if (now - _lastReconnectAttempt < _reconnectDelay) return;
@@ -226,6 +262,26 @@ void MQTTService::publishDiscovery() {
         dev["sw"] = FW_VERSION;
     };
 
+    // Bezpečný publish — pokud payload nevejde do bufferu, dočasně ho zvětší.
+    // PubSubClient::setBufferSize realokuje, ale neopouští buffer při publish, takže
+    // se zvětšení musí udělat PŘEDEM. Po každé publishi se vrací zpět na 512.
+    auto safePublish = [&](const char* topic, const char* payload, bool retained) -> bool {
+        size_t needed = strlen(topic) + strlen(payload) + 8; // 5B fixed header + slack
+        uint16_t cur = _mqttClient.getBufferSize();
+        bool resized = false;
+        if (needed > cur) {
+            if (!_mqttClient.setBufferSize((uint16_t)((needed + 63) & ~63u))) {
+                Serial.printf("[MQTT] HA discovery: buffer resize to %u failed\n", (unsigned)needed);
+                return false;
+            }
+            resized = true;
+        }
+        bool ok = _mqttClient.publish(topic, payload, retained);
+        if (!ok) Serial.printf("[MQTT] HA discovery publish failed: %s (len=%u)\n", topic, (unsigned)strlen(payload));
+        if (resized) _mqttClient.setBufferSize(512);
+        return ok;
+    };
+
     auto pub = [&](const char* name, const char* uid, const char* state_topic,
                     const char* unit, const char* dev_class, const char* icon,
                     bool isDiag, const String& base_topic,
@@ -245,7 +301,7 @@ void MQTTService::publishDiscovery() {
 
         String p; serializeJson(doc, p);
         String configTopic = base_topic + "_" + uid + "/config";
-        _mqttClient.publish(configTopic.c_str(), p.c_str(), true);
+        safePublish(configTopic.c_str(), p.c_str(), true);
     };
 
     // --- SENSORS ---
@@ -276,7 +332,7 @@ void MQTTService::publishDiscovery() {
 
         String p; serializeJson(doc, p);
         String configTopic = "homeassistant/alarm_control_panel/" + String(_deviceId) + "_alarm/config";
-        _mqttClient.publish(configTopic.c_str(), p.c_str(), true);
+        safePublish(configTopic.c_str(), p.c_str(), true);
     }
 
     // --- BINARY SENSORS ---
@@ -360,7 +416,7 @@ void MQTTService::checkCertificateExpiry() {
     if(days_left < 30) {
         Serial.println("[Cert] ⚠️ WARNING: Certificate expires soon!");
         if(_mqttClient.connected()) {
-            _mqttClient.publish(_topics.notification, "⚠️ WARNING: SSL Certificate expires soon!", true);
+            _mqttClient.publish(_topics.notification, "WARNING: SSL certificate expiring soon!", true);
         }
     } else {
         Serial.println("[Cert] ✅ Certificate is valid.");

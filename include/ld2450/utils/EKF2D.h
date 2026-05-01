@@ -93,6 +93,8 @@ public:
             memset(_cov, 0, sizeof(_cov));
             _cov[0][0] = _cov[1][1] = 100.0f;
             _cov[2][2] = _cov[3][3] = 50.0f;
+            // Bez aktualizace _lastUpdateMs by příští dt byl nesmyslně velký → další divergence.
+            _lastUpdateMs = nowMs;
             return;
         }
         float invDet = 1.0f / det;

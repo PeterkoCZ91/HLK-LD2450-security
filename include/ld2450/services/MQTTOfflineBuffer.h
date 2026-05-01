@@ -22,6 +22,10 @@ public:
     bool peek(char* topic, size_t topicLen, char* payload, size_t payloadLen) const;
     void consume();
     uint32_t count() const { return _count; }
+    // Lazy persist: zavolat z hlavního loop / MQTT update, save proběhne max 1x za SAVE_INTERVAL_MS
+    void update();
+    // Vynutit okamžitý zápis (např. před restartem)
+    void flushNow();
 
 private:
     void loadFromDisk();
@@ -31,6 +35,9 @@ private:
     uint32_t _head  = 0;
     uint32_t _count = 0;
     bool _fsAvailable = false;
+    bool _dirty = false;
+    unsigned long _lastSave = 0;
+    static constexpr unsigned long SAVE_INTERVAL_MS = 30000;
     const char* _filename = "/mqtt_ofb.bin";
 };
 
