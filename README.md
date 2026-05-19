@@ -1,5 +1,6 @@
 # :shield: LD2450 Security :radar:
 
+[![CI](https://github.com/PeterkoCZ91/HLK-LD2450-security/actions/workflows/ci.yml/badge.svg)](https://github.com/PeterkoCZ91/HLK-LD2450-security/actions/workflows/ci.yml)
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange?logo=platformio)](https://platformio.org/)
 [![ESP32](https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue?logo=espressif)](https://www.espressif.com/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
