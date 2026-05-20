@@ -85,7 +85,9 @@ Optional: piezo buzzer or relay for siren output (any GPIO).
 
 ## Quick Start
 
-**~10 minutes from clone to working system.**
+**Don't want to build from source?** Download the pre-built binary from the [**Releases page**](../../releases/latest) and follow the [**Flashing Guide**](docs/flashing.md) — no PlatformIO needed.
+
+**Building from source (~10 minutes):**
 
 ```bash
 # 1. Clone

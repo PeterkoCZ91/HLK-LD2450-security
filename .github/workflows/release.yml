@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO and esptool
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio esptool
+
+      - name: Prepare example configuration
+        run: |
+          cp include/secrets.h.example include/secrets.h
+          cp include/ld2450/known_devices.h.example include/ld2450/known_devices.h
+
+      - name: Build firmware (lab — USB flash, plain MQTT)
+        run: pio run -e ld2450_lab
+
+      - name: Merge into single flashable binary
+        run: |
+          BOOT_APP0=$(find ~/.platformio -name boot_app0.bin | head -1)
+          esptool.py merge_bin \
+            --output firmware-ld2450-${{ github.ref_name }}.bin \
+            --chip esp32 \
+            --flash_mode dio \
+            --flash_freq 40m \
+            --flash_size 4MB \
+            0x1000  .pio/build/ld2450_lab/bootloader.bin \
+            0x8000  .pio/build/ld2450_lab/partitions.bin \
+            0xe000  "$BOOT_APP0" \
+            0x10000 .pio/build/ld2450_lab/firmware.bin
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: firmware-ld2450-${{ github.ref_name }}.bin
+          generate_release_notes: false
+          body: |
+            ## Quick Flash
+
+            **Download** `firmware-ld2450-${{ github.ref_name }}.bin` and flash with one command:
+
+            ```bash
+            # Install esptool (once)
+            pip install esptool
+
+            # Flash (replace PORT with your serial port)
+            esptool.py --chip esp32 --port PORT --baud 460800 write_flash 0x0 firmware-ld2450-${{ github.ref_name }}.bin
+            ```
+
+            | OS | Port example |
+            |----|-------------|
+            | Linux | `/dev/ttyUSB0` or `/dev/ttyACM0` |
+            | macOS | `/dev/cu.usbserial-*` |
+            | Windows | `COM3` (check Device Manager) |
+
+            > If flashing fails, hold the **BOOT** button on the ESP32 while the flash command starts.
+
+            ## Wiring & First Boot
+
+            See **[docs/flashing.md](https://github.com/PeterkoCZ91/HLK-LD2450-security/blob/main/docs/flashing.md)** for full wiring diagram, first-boot setup, and troubleshooting.
+
+            ## What's in this build
+
+            - Environment: `ld2450_lab` (USB flash, plain MQTT — configure MQTTS/TLS via web UI after first boot)
+            - Chip: ESP32-WROOM-32
+            - Flash size: 4 MB, partition scheme: min\_spiffs
