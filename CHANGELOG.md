@@ -4,10 +4,11 @@ All notable changes to LD2450 Security are documented here.
 
 ---
 
-## [v5.7.5] — 2025-05
+## [v5.7.5] — 2026-05
 
-### Changed
-- CI workflow added (build + parser tests on every push/PR)
+### Added
+- CI workflow (build firmware + run parser tests on every push/PR)
+- CONTRIBUTING.md, issue templates, PR template, SECURITY.md, `.editorconfig`
 
 ## [v5.7] — 2025-05
 
@@ -16,7 +17,9 @@ All notable changes to LD2450 Security are documented here.
 - **Day / night zone profiles** — per-zone HH:MM switch times; each polygon and blackout zone carries a day-only / night-only / both mask
 - **Bilingual web UI** — built-in Czech / English toggle, persisted in `localStorage`
 - **Parser regression tests** — 16 host-side Unity tests covering valid frames, multi-target, origin-target with non-zero resolution (HLK firmware v2.14), trailing garbage, and back-to-back parsing (`pio test -e native`)
-- Refactored route layer: REST endpoints split into `network_routes`, `security_routes`, `schedule_routes`, `system_routes`, `telemetry_routes`, `zone_routes`
+
+### Changed
+- Route layer refactored: REST endpoints split into `network_routes`, `security_routes`, `schedule_routes`, `system_routes`, `telemetry_routes`, `zone_routes`
 
 ## [v5.5] — 2025-03
 
