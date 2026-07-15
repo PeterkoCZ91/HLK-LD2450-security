@@ -15,7 +15,7 @@ Fixes # <!-- issue number, if applicable -->
 ## Testing
 
 - [ ] `pio test -e native` passes (16/16 parser tests)
-- [ ] `pio run -e ld2450_lab` builds without errors
+- [ ] `pio run -e ld2450_release` builds without errors
 - [ ] Tested on hardware (if applicable — note board and firmware version)
 - [ ] Web UI verified in browser (if UI changes — both CS and EN modes)
 - [ ] MQTT / Home Assistant entities verified (if connectivity changes)

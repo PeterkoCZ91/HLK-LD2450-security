@@ -1,6 +1,6 @@
 /**
  * main_ld2450.cpp
- * ESP32 Security Node - LD2450 Edition v5.4.0
+ * ESP32 Security Node - LD2450 Edition
  * Multi-Target Tracking + Security System
  */
 

@@ -4,13 +4,27 @@ All notable changes to LD2450 Security are documented here.
 
 ---
 
+## [v5.7.6] — 2026-07-15
+
+### Fixed
+- GitHub Release binary creation with the esptool 5.x command-line interface
+- Pre-built firmware now uses the captive-portal release environment instead of development mode
+
+### Changed
+- GitHub Actions upgraded to Node.js 24-based releases
+- PlatformIO and esptool versions pinned in CI and release jobs for reproducible builds
+- SHA-256 checksum published alongside each firmware binary
+- Flashing documentation updated to the current esptool command syntax
+
+> Firmware functionality is unchanged from v5.7.5.
+
 ## [v5.7.5] — 2026-05
 
 ### Added
 - CI workflow (build firmware + run parser tests on every push/PR)
 - CONTRIBUTING.md, issue templates, PR template, SECURITY.md, `.editorconfig`
 
-## [v5.7] — 2025-05
+## [v5.7] — 2026-05
 
 ### Added
 - **Hardware region filter** — native LD2450 cmd 0xC2: 3 rectangular zones in include/exclude mode, filtering done radar-side before UART
@@ -21,7 +35,7 @@ All notable changes to LD2450 Security are documented here.
 ### Changed
 - Route layer refactored: REST endpoints split into `network_routes`, `security_routes`, `schedule_routes`, `system_routes`, `telemetry_routes`, `zone_routes`
 
-## [v5.5] — 2025-03
+## [v5.5] — 2026-03
 
 ### Added
 - MQTT offline buffer — LittleFS-backed ring buffer (30 messages), survives reboot, auto-replay on reconnect
@@ -32,25 +46,25 @@ All notable changes to LD2450 Security are documented here.
 - BLE configuration — NimBLE peripheral for mobile setup (passkey-protected)
 - 13 security fixes ported from LD2412 security audit
 
-## [v5.4] — 2025-02
+## [v5.4] — 2026-03
 
 ### Added
 - Extended Kalman Filter (EKF2D) per target — smooth trajectory estimation for [x, y, vx, vy]
 - Hungarian-algorithm-inspired target association across frames
 
-## [v5.3] — 2025-01
+## [v5.3] — 2026-02
 
 ### Added
 - Blackout zone drawing — draw rectangular exclusion areas directly on the radar map
 - Anti-masking detection — alert when sensor is obstructed while armed
 
-## [v5.2] — 2024-12
+## [v5.2] — 2026-02
 
 ### Added
 - Background calibration — 80×80 grid noise map, learns static reflectors over ~1 h in an empty room
 - Noise map overlay on live radar display
 
-## [v5.0–v5.1] — 2024-11
+## [v5.0–v5.1] — 2026-02
 
 ### Added
 - Alarm state machine — 5 states (DISARMED / ARMING / ARMED / PENDING / TRIGGERED) with configurable entry/exit delays

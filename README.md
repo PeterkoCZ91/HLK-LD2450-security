@@ -4,7 +4,7 @@
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange?logo=platformio)](https://platformio.org/)
 [![ESP32](https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue?logo=espressif)](https://www.espressif.com/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-5.7.5-blue)]()
+[![Release](https://img.shields.io/github/v/release/PeterkoCZ91/HLK-LD2450-security)](https://github.com/PeterkoCZ91/HLK-LD2450-security/releases/latest)
 
 **Multi-target intrusion detection system** built on ESP32 + HLK-LD2450 24 GHz mmWave radar. Real-time 2D target tracking with Kalman filtering, polygon detection zones, ghost suppression via background calibration, full alarm state machine, Home Assistant integration, Telegram bot, and a dark-mode bilingual (CS/EN) web dashboard with live radar map. No cloud required.
 
@@ -102,7 +102,7 @@ cp include/ld2450/known_devices.h.example include/ld2450/known_devices.h
 # 3. Wire the sensor (see table below) and connect ESP32 via USB
 
 # 4. Build and flash
-pio run -e ld2450_lab --target upload
+pio run -e ld2450_release --target upload
 
 # 5. First boot: connect to the WiFi AP "esp32-ld2450-XXXX" (password from AP_PASS)
 #    Configure your WiFi and MQTT in the captive portal
@@ -118,7 +118,7 @@ pio run -e ld2450_lab --target upload
 | 5V | VCC | Power |
 | GND | GND | Ground |
 
-> UART baud rate: 256000, 8N1, Serial2. For ESP32-C6, use the same pins -- native USB is on a separate interface.
+> UART baud rate: 256000, 8N1, Serial2.
 
 ---
 
@@ -434,7 +434,7 @@ The LD2450 radar module has its own firmware, separate from the ESP32. You can c
 - No multi-sensor coordination yet (each node is independent)
 - Background calibration requires ~1 hour in an empty room
 - Blackout zones are rectangular only (polygons for detection zones only)
-- Day/night profile applies only to blackout zones; polygon zones are active in both profiles
+- Blackout zone masks are configurable in the web UI; polygon masks are currently API-only
 
 </details>
 
@@ -534,11 +534,11 @@ About $12 for a single node (ESP32 + LD2450 + power supply). No subscriptions, n
 ## Testing
 
 ```bash
-# Build for lab (USB flash)
-pio run -e ld2450_lab
+# Build release firmware (USB flash + captive portal)
+pio run -e ld2450_release
 
 # Flash via USB
-pio run -e ld2450_lab --target upload
+pio run -e ld2450_release --target upload
 
 # Flash via OTA (change IP in platformio.ini first)
 pio run -e ld2450_prod --target upload
@@ -548,7 +548,8 @@ pio run -e ld2450_prod --target upload
 
 | Environment | Board | Upload | Use case |
 |-------------|-------|--------|----------|
-| `ld2450_lab` | ESP32-WROOM | USB | Development, debug |
+| `ld2450_release` | ESP32-WROOM | USB | Pre-built release, captive portal, MQTTS |
+| `ld2450_lab` | ESP32-WROOM | USB | Development with compile-time WiFi, no web auth |
 | `ld2450_prod` | ESP32-WROOM | OTA | Production deployment |
 | `native` | host | -- | Parser regression tests (`pio test -e native`) |
 
@@ -626,7 +627,7 @@ Evolved from a simple presence detector into a full multi-target security system
 | Foundation | v1.x--v3.x | Basic presence, MQTT, web UI |
 | Multi-target | v4.x | Target tracking, polygon zones, radar map |
 | Intelligence | v5.0--v5.2 | Kalman filter, ghost detection, background calibration |
-| Security hardening | v5.3--v5.5 | Blackout zones, BLE config, LD2412 audit port, ESP32-C6 |
+| Security hardening | v5.3--v5.5 | Blackout zones, BLE config, LD2412 audit port |
 | Refinement | v5.6--v5.7 | Hardware region filter, day/night profiles, bilingual UI, parser regression tests |
 
 See [CHANGELOG.md](CHANGELOG.md) for detailed version history.

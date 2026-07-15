@@ -20,6 +20,17 @@ Go to the [**Releases page**](https://github.com/PeterkoCZ91/HLK-LD2450-security
 
 ```
 firmware-ld2450-vX.Y.Z.bin
+firmware-ld2450-vX.Y.Z.bin.sha256
+```
+
+Verify the download before flashing:
+
+```bash
+# Linux
+sha256sum --check firmware-ld2450-vX.Y.Z.bin.sha256
+
+# macOS
+shasum -a 256 --check firmware-ld2450-vX.Y.Z.bin.sha256
 ```
 
 ---
@@ -33,7 +44,7 @@ pip install esptool
 Verify:
 
 ```bash
-esptool.py version
+esptool version
 ```
 
 ---
@@ -73,7 +84,7 @@ Optional: connect a passive piezo buzzer or relay between any free GPIO and GND 
 Connect the ESP32 to your PC via USB, then run:
 
 ```bash
-esptool.py --chip esp32 --port PORT --baud 460800 write_flash 0x0 firmware-ld2450-vX.Y.Z.bin
+esptool --chip esp32 --port PORT --baud 460800 write-flash 0x0 firmware-ld2450-vX.Y.Z.bin
 ```
 
 Replace `PORT` with your serial port:

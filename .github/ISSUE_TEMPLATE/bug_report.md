@@ -26,8 +26,8 @@ labels: bug
 
 | Field | Value |
 |-------|-------|
-| Firmware version | <!-- e.g. v5.7.5 — shown in System tab / `/api/version` --> |
-| Build environment | <!-- ld2450_lab / ld2450_prod --> |
+| Firmware version | <!-- e.g. v5.7.6 — shown in System tab / `/api/version` --> |
+| Build environment | <!-- ld2450_release / ld2450_lab / ld2450_prod --> |
 | ESP32 board | <!-- e.g. ESP32-WROOM-32 DevKit --> |
 | LD2450 firmware | <!-- visible in HLKRadarTool app --> |
 | PlatformIO version | <!-- `pio --version` --> |
