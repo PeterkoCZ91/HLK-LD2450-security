@@ -87,7 +87,7 @@ This is an embedded C++ project targeting ESP32 Arduino. Follow the conventions 
 - `UPPER_SNAKE_CASE` for constants and `#define`s, `PascalCase` for classes, `camelCase` for functions and variables
 - No dynamic allocation in hot paths (`new`/`delete` only at init time)
 - Keep ISR and UART task callbacks short; defer work to the main loop via queues
-- No `Serial.print` in production paths — use the `EventLog` service
+- `Serial.print`/`printf` is used for boot and runtime **diagnostics**; persistent **security events** (alarms, arm/disarm, tamper) must go through the `EventLog` service so they survive reboots. Keep diagnostic logging out of hot paths (ISR/UART callbacks)
 - `secrets.h` and `known_devices.h` must never appear in a commit (they are in `.gitignore`)
 
 ---

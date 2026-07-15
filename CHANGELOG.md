@@ -16,6 +16,14 @@ All notable changes to LD2450 Security are documented here.
 - SHA-256 checksum published alongside each firmware binary
 - Flashing documentation updated to the current esptool command syntax
 
+### Documentation
+- Corrected the MQTT topic reference table to match the firmware (`tracking/count`, `presence/notification`, `rssi`, `health`, `heap`, …) and added previously undocumented topics
+- Fixed the Dead Man's Switch description (10-minute timeout, max 3 restarts, then degraded local-only mode — was incorrectly "60 minutes")
+- Renamed the tracking filter from "Extended Kalman Filter (EKF2D)" to the accurate "constant-velocity Kalman filter"; described ghost suppression as adaptive background/noise-map filtering rather than "AI / noise learning"
+- Corrected over-claims: config backup/restore covers core settings (not "all settings"); siren output is compile-time optional with no dashboard control
+- SECURITY.md: clarified that core operation needs no cloud (optional Telegram uses Telegram's cloud); noted the web UI is plain HTTP and should stay on a trusted LAN
+- CONTRIBUTING.md: reconciled the logging guideline with actual practice
+
 > Firmware functionality is unchanged from v5.7.5.
 
 ## [v5.7.5] — 2026-05

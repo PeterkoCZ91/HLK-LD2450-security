@@ -24,9 +24,9 @@ You will receive a response within 7 days. If the issue is confirmed, a fix will
 
 ## Scope
 
-This project runs on a local ESP32 with no cloud connectivity. Relevant attack surfaces:
+This project runs on a local ESP32 and requires no cloud service for its core operation. The optional Telegram bot is an outbound integration with Telegram's cloud (`api.telegram.org`); enable it only if you want that. Relevant attack surfaces:
 
-- **Web UI (port 80)** — HTTP Basic Auth; default credentials (`admin/admin`) trigger a warning banner
+- **Web UI (port 80)** — HTTP Basic Auth over **unencrypted HTTP** (credentials are only base64-encoded on the wire); default credentials (`admin/admin`) trigger a warning banner
 - **MQTT** — optional MQTTS (TLS on port 8883) with CA cert validation
 - **BLE pairing** — NimBLE peripheral, 6-digit passkey required
 - **OTA updates** — password-protected; optional MD5 hash verification
@@ -37,6 +37,7 @@ Out of scope: physical access to the ESP32, LD2450 radar module firmware (mainta
 ## Security Hardening Notes
 
 - Change default web credentials immediately after first boot
+- **Keep the device on a trusted/isolated LAN.** The web UI is plain HTTP (port 80), so Basic Auth credentials and session traffic are not encrypted — do not expose it to the internet directly; put it behind a reverse proxy with TLS, a VPN, or a dedicated VLAN
 - Use MQTTS (port 8883) in production deployments
 - Keep `secrets.h` and `known_devices.h` out of version control (both are in `.gitignore`)
 - Consider disabling the LD2450 BLE radio via the System tab after initial setup

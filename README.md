@@ -42,7 +42,7 @@
 ## In 3 Points
 
 1. **2D multi-target tracking, not just presence.** The LD2450 reports X/Y coordinates and speed for up to 3 simultaneous targets. This firmware turns that into a security system with polygon zones, approach trails, and a live radar map.
-2. **AI ghost suppression.** mmWave radars see reflections from furniture, HVAC, and metal surfaces. A noise learning mode builds an 80x80 grid map of static reflectors and filters them out automatically.
+2. **Adaptive ghost suppression.** mmWave radars see reflections from furniture, HVAC, and metal surfaces. A background calibration builds an 80x80 grid map of static reflectors and filters them out automatically (threshold-based background subtraction, not machine learning).
 3. **Battle-tested architecture.** Shares the alarm state machine, MQTT offline resilience, and security hardening from the [LD2412-security](https://github.com/PeterkoCZ91/HLK-LD2412-security) project. Running in production since 2025.
 
 ---
@@ -67,7 +67,7 @@
 | 5 V power supply | Stable supply for both ESP32 and radar | $2--3 |
 | **Total** | | **~$12** |
 
-Optional: piezo buzzer or relay for siren output (any GPIO).
+Optional siren output — disabled by default (`SIREN_PIN_DEFAULT = -1`) and set at compile time; there is no dashboard control for it yet. Use an active buzzer, or drive a relay/high-power load through a transistor with a flyback diode — do not wire a relay coil directly to a GPIO.
 
 ### Software (All Free)
 
@@ -130,7 +130,7 @@ The LD2450 radar continuously scans a 120-degree field at 24 GHz, reporting X/Y 
   LD2450 Radar            ESP32 Processing Pipeline             Outputs
  +------------+     +-----------------------------------+    +-----------+
  |  24 GHz    | UART|  Frame Parser (3 targets/frame)   |    |  MQTT/HA  |
- |  FMCW      |---->|  Kalman Filter (EKF2D per target) |    |  Telegram |
+ |  FMCW      |---->|  Kalman Filter (per target)       |    |  Telegram |
  |  120 deg   |     |  Ghost Detector (noise map)       |--->|  Siren    |
  |  3 targets |     |  Zone Classifier (polygon/bbox)   |    |  Web UI   |
  |  ~10 Hz    |     |  Alarm State Machine              |    |  BLE      |
@@ -172,7 +172,7 @@ States: **DISARMED** -> **ARMING** (exit delay) -> **ARMED** -> **PENDING** (ent
 | RSSI anomaly detection | WiFi jamming alert with baseline tracking |
 | Scheduled arm / disarm | Daily HH:MM auto-arm/disarm + auto-arm after inactivity timeout |
 | Auto-rearm | Re-arms after trigger timeout (default 15 min) |
-| Siren/strobe output | Optional GPIO for audible/visual alarm |
+| Siren/strobe output | Compile-time optional (disabled by default, no dashboard control) |
 | Disarm reminder | Notification if system left disarmed |
 
 ### :dart: Tracking
@@ -180,7 +180,7 @@ States: **DISARMED** -> **ARMING** (exit delay) -> **ARMED** -> **PENDING** (ent
 | Feature | Description |
 |---------|-------------|
 | Multi-target tracking | Up to 3 simultaneous targets with X/Y/speed |
-| Extended Kalman Filter | EKF2D per target for smooth trajectory estimation |
+| Kalman filter (constant-velocity) | Per-target `[x, y, vx, vy]` smoothing for stable trajectory estimation |
 | Target association | Hungarian-algorithm-inspired matching across frames |
 | Ghost detection | Static targets exceeding timeout classified as ghosts |
 | Background calibration | 80x80 grid noise map learns static reflectors (~1 h calibration) |
@@ -199,7 +199,7 @@ States: **DISARMED** -> **ARMING** (exit delay) -> **ARMED** -> **PENDING** (ent
 | BLE configuration | NimBLE peripheral for mobile setup (passkey-protected) |
 | WiFi failover | Backup SSID with automatic reconnection |
 | OTA updates | Web-based and ArduinoOTA firmware upload, optional MD5 hash check |
-| Dead Man's Switch | Auto-restart if no MQTT publish in 60 min |
+| Dead Man's Switch | Auto-restart if no MQTT publish for 10 min (max 3 restarts, then degraded local-only mode) |
 
 ### :bar_chart: Diagnostics
 
@@ -219,7 +219,7 @@ States: **DISARMED** -> **ARMING** (exit delay) -> **ARMED** -> **PENDING** (ent
 | Web dashboard | Responsive dark/light UI with live radar map and SSE updates |
 | Bilingual UI | Built-in Czech / English toggle, persisted in localStorage |
 | REST API | Full config, telemetry, alarm, zone, schedule, and OTA endpoints |
-| Config backup/restore | JSON export/import of all settings |
+| Config backup/restore | JSON export/import of core settings (zones, security, MQTT, Telegram chat) |
 | mDNS | `http://hostname.local/` access |
 
 ---
@@ -314,15 +314,27 @@ Prefix: `security/<device_id>/`
 
 | Topic | Direction | Description |
 |-------|-----------|-------------|
-| `presence/state` | publish | IDLE / PRESENCE / HOLD |
-| `presence/count` | publish | Number of active targets |
+| `presence/state` | publish | Presence state (e.g. IDLE / PRESENCE / HOLD) |
+| `presence/notification` | publish | System notifications (OTA, alerts) |
+| `tracking/count` | publish | Number of active targets |
+| `tracking/target1/x` … `target3/x` | publish | Target X coordinate (mm) |
+| `tracking/target1/y` … `target3/y` | publish | Target Y coordinate (mm) |
 | `alarm/state` | publish | disarmed / arming / armed_away / pending / triggered |
-| `alarm/command` | subscribe | arm / disarm / arm_now |
-| `notification` | publish | System notifications (OTA, alerts, learning) |
-| `diag/rssi` | publish | WiFi signal strength |
-| `diag/health_score` | publish | Radar health 0--100 |
-| `diag/heap_free` | publish | Free heap bytes |
+| `alarm/command` | subscribe | arm / disarm / arm_now (disarm requires the code when `sec_code` is set) |
+| `entry_count` / `exit_count` | publish | Tripwire entry / exit counters |
+| `tamper` | publish | Tamper status |
+| `rssi` | publish | WiFi signal strength (dBm) |
+| `health` | publish | Radar health score 0–100 |
+| `heap` / `heap_max` | publish | Free heap / largest free block (bytes) |
+| `uptime` | publish | Uptime (s) |
+| `net_quality` | publish | Network quality metric |
+| `ip` | publish | Device IP address |
+| `boot` / `restart_reason` | publish | Boot marker / last restart reason |
+| `radar_type` | publish | Radar model identifier (`ld2450`) |
 | `availability` | publish | online / offline (LWT) |
+
+> Home Assistant entities are created automatically via MQTT discovery — the table
+> above is the raw topic contract for manual integrations (Node-RED etc.).
 
 ---
 
@@ -355,7 +367,7 @@ include/ld2450/
  +-- types.h                   Data structures, enums, AppContext
  +-- web_interface.h           Embedded HTML/CSS/JS dashboard with CS/EN i18n
  +-- utils/
-      +-- EKF2D.h              2D Extended Kalman Filter [x,y,vx,vy]
+      +-- EKF2D.h              2D constant-velocity Kalman filter [x,y,vx,vy]
       +-- TargetAssociation.h  Cross-frame target matching (Hungarian-inspired)
       +-- ld2450_frame.h       Pure parsing helpers, shared with native unit tests
 
@@ -474,7 +486,7 @@ The two projects share the same alarm state machine, security architecture, and 
 | Entry/exit counter | :white_check_mark: Done | Virtual tripwire line with directional counting (v5.5) |
 | Movement classification | :white_check_mark: Done | Standing/walking/running per target (v5.5) |
 | Zone dwell time | :white_check_mark: Done | Per-target time spent in polygon zones (v5.5) |
-| Kalman filter tracking | :white_check_mark: Done | EKF2D per target (v5.4) |
+| Kalman filter tracking | :white_check_mark: Done | Constant-velocity KF per target (v5.4) |
 | Blackout zone drawing | :white_check_mark: Done | Draw on radar map (v5.3) |
 | Background calibration | :white_check_mark: Done | 80x80 noise map (v5.2) |
 | Security audit port | :white_check_mark: Done | 13 fixes from LD2412 audit (v5.5) |
@@ -500,7 +512,7 @@ The **LD2412** reports 1 target with distance and energy levels across 14 detect
 <details>
 <summary><strong>How do I reduce false alarms?</strong></summary>
 
-1. **AI noise learning** -- run the 1h calibration in an empty room to build a noise map
+1. **Background noise mapping** -- run the 1h calibration in an empty room to build a noise map
 2. **Blackout zones** -- exclude known reflectors (HVAC, metal furniture, antennas)
 3. **Min target size** -- increase to filter small reflections
 4. **Ghost timeout** -- reduce to classify static objects faster
@@ -518,7 +530,7 @@ Yes, 24 GHz radar penetrates drywall, wood, and thin partitions. Use blackout zo
 <details>
 <summary><strong>What happens when WiFi goes down?</strong></summary>
 
-The alarm keeps running locally. Events are logged to flash. A Dead Man's Switch restarts the ESP32 if MQTT is unreachable for 60 minutes.
+The alarm keeps running locally. Events are logged to flash. A Dead Man's Switch restarts the ESP32 if MQTT is unreachable for 10 minutes — up to 3 times, after which it stays in a degraded local-only mode instead of restarting indefinitely.
 
 </details>
 
@@ -566,8 +578,8 @@ The `native` environment compiles the radar frame parser against Unity test fram
 Each device identifies itself by MAC address using the `known_devices.h` lookup table:
 
 ```c
-{ "aa:bb:cc:dd:ee:f1", "ld2450_living_room", "sensor-ld2450-living-room" },
-{ "aa:bb:cc:dd:ee:f2", "ld2450_hallway",     "sensor-ld2450-hallway" },
+{ "aa:bb:cc:dd:ee:01", "ld2450_living_room", "ld2450-living-room" },
+{ "aa:bb:cc:dd:ee:02", "ld2450_hallway",     "ld2450-hallway" },
 ```
 
 ---
