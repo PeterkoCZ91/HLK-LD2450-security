@@ -1,6 +1,22 @@
 #include "ld2450/services/MQTTService.h"
 #include "ld2450/constants.h"
 
+// CON-01: RAII lock for the recursive client mutex. No-op if the mutex was not
+// created (extreme low-heap fallback) so behaviour degrades to the old racy
+// path rather than crashing.
+namespace {
+struct ClientLock {
+    SemaphoreHandle_t m;
+    bool held;
+    // wait: bounded for callers that must not stall behind a blocking connect().
+    explicit ClientLock(SemaphoreHandle_t mtx, TickType_t wait = portMAX_DELAY)
+        : m(mtx), held(false) {
+        if (m) held = (xSemaphoreTakeRecursive(m, wait) == pdTRUE);
+    }
+    bool ok() const { return !m || held; }
+    ~ClientLock() { if (m && held) xSemaphoreGiveRecursive(m); }
+};
+}
 
 // Forward extern for CA cert if it's not in secrets.h (it IS in secrets.h usually)
 // In main it was used as `mqtt_server_ca`. It comes from secrets.h.
@@ -10,6 +26,7 @@ MQTTService::MQTTService() : _mqttClient(_plainClient) {
 }
 
 void MQTTService::begin(Preferences* prefs, const char* deviceId, NetworkQuality* netQuality) {
+    if (!_clientMutex) _clientMutex = xSemaphoreCreateRecursiveMutex();
     _prefs = prefs;
     _netQuality = netQuality;
     strncpy(_deviceId, deviceId, 31);
@@ -96,8 +113,7 @@ void MQTTService::setupClient() {
 
 #ifdef MQTTS_ENABLED
     if (_tlsEnabled) {
-        // Validace CA cert obsahu — pokud je placeholder/empty, nepokoušet se TLS handshake
-        // jinak by to skončilo v restart-loopu (DMS) bez šance na zotavení.
+        // Validate the CA cert content: a placeholder/empty cert must not be accepted.
         bool caValid = (mqtt_server_ca != nullptr) &&
                        (strstr(mqtt_server_ca, "BEGIN CERTIFICATE") != nullptr) &&
                        (strlen(mqtt_server_ca) > 200);
@@ -105,10 +121,14 @@ void MQTTService::setupClient() {
             _secureClient.setCACert(mqtt_server_ca);
             _mqttClient.setClient(_secureClient);
         } else {
-            Serial.println("[MQTT] WARNING: CA cert missing/placeholder — falling back to plain TCP");
-            _tlsEnabled = false;
-            // Pokud port byl 8883, ponecháme ho — uživatel pak vidí connect-fail a opraví config.
-            _mqttClient.setClient(_plainClient);
+            // SEC-05: fail closed. TLS was requested but no valid CA is configured.
+            // Silently downgrading to plaintext would expose MQTT credentials and
+            // remote alarm commands, so refuse to connect instead. connect() checks
+            // _tlsMisconfigured and never opens a socket. The client pointer is still
+            // set (to the secure client) so downstream connected()/publish() are safe.
+            Serial.println("[MQTT] ERROR: TLS requested but CA missing/placeholder - refusing to connect (fail closed)");
+            _tlsMisconfigured = true;
+            _mqttClient.setClient(_secureClient);
         }
     } else {
         _mqttClient.setClient(_plainClient);
@@ -126,26 +146,34 @@ void MQTTService::setCallback(MQTT_CALLBACK_SIGNATURE) {
 void MQTTService::update() {
     if (!_enabled || strlen(_server) == 0) return;
 
+    ClientLock lock(_clientMutex);
     if (!_mqttClient.connected()) {
         connect();
     } else {
         _mqttClient.loop();
     }
 
-    // Lazy persistence offline bufferu (chrání flash před wear-outem při flapping MQTT)
+    // Lazy persistence of the offline buffer (protects flash from wear when MQTT flaps)
     _offlineBuffer.update();
 }
 
 bool MQTTService::connected() {
-    return _enabled && _mqttClient.connected();
+    if (!_enabled) return false;
+    ClientLock lock(_clientMutex, pdMS_TO_TICKS(200));
+    if (!lock.ok()) return false;  // connect() in progress
+    return _mqttClient.connected();
 }
 
 bool MQTTService::publish(const char* topic, const char* payload, bool retained) {
     if (!_enabled) {
         return false;
     }
+    // Bounded wait: connect() holds the lock during a blocking (TLS) connect.
+    // On timeout the message is dropped (buffer is protected by the same lock).
+    ClientLock lock(_clientMutex, pdMS_TO_TICKS(200));
+    if (!lock.ok()) return false;
     if (!_mqttClient.connected()) {
-        _offlineBuffer.push(topic, payload);
+        _offlineBuffer.push(topic, payload, retained);  // MQTT-01: keep retained
         return false;
     }
 
@@ -153,6 +181,8 @@ bool MQTTService::publish(const char* topic, const char* payload, bool retained)
     uint32_t freeHeap = ESP.getFreeHeap();
     if (freeHeap < HEAP_MIN_FOR_PUBLISH) {
         Serial.printf("[MQTT] Heap guard: skip publish (%u < %u)\n", freeHeap, HEAP_MIN_FOR_PUBLISH);
+        // Not sent: keep it (static buffer, no heap) so retained state gets replayed.
+        _offlineBuffer.push(topic, payload, retained);
         return false;
     }
     if (freeHeap < HEAP_LOW_WARNING) {
@@ -164,12 +194,29 @@ bool MQTTService::publish(const char* topic, const char* payload, bool retained)
     }
 
     bool ok = _mqttClient.publish(topic, payload, retained);
-    if (ok) _lastSuccessfulPublish = millis();
+    if (ok) {
+        _lastSuccessfulPublish = millis();
+    } else {
+        // MQTT-01: a transient connected-publish failure must not be lost;
+        // buffer it (with retained) so it replays on the next reconnect.
+        _offlineBuffer.push(topic, payload, retained);
+    }
     return ok;
 }
 
 void MQTTService::connect() {
     if (!_enabled) return;
+
+    // SEC-05: never open a socket when TLS is requested but misconfigured, as that
+    // would leak credentials over plaintext. Rate-limited diagnostic only.
+    if (_tlsMisconfigured) {
+        static unsigned long lastMisconfigLog = 0;
+        if (millis() - lastMisconfigLog > 60000) {
+            Serial.println("[MQTT] TLS misconfigured (no valid CA) - connection refused. Fix mqtt_server_ca.");
+            lastMisconfigLog = millis();
+        }
+        return;
+    }
 
     // Exponential backoff
     unsigned long now = millis();
@@ -198,8 +245,11 @@ void MQTTService::connect() {
         _mqttClient.publish(_topics.radar_type, "ld2450", true);
         _mqttClient.publish(_topics.tamper, "OK", true);
 
-        // Subscribe to alarm command topic
+#ifdef ENABLE_MQTT_ALARM_COMMANDS
+        // Subscribe to alarm command topic (remote ARM/DISARM). Disabled by default —
+        // remote alarm control via MQTT is off until the HA integration is reworked.
         _mqttClient.subscribe(_topics.alarm_command);
+#endif
 
         publishDiscovery();
 
@@ -211,11 +261,12 @@ void MQTTService::connect() {
 
         _mqttClient.publish(_topics.ip, WiFi.localIP().toString().c_str(), true);
 
-        // Replay offline buffer
+        // Replay offline buffer, preserving each record's retained flag (MQTT-01).
         char t[MQTT_OFB_TOPIC_LEN], p[MQTT_OFB_PAYLOAD_LEN];
+        bool rtn = false;
         while (_offlineBuffer.hasMessages()) {
-            if (_offlineBuffer.peek(t, sizeof(t), p, sizeof(p))) {
-                if (_mqttClient.publish(t, p, false)) {
+            if (_offlineBuffer.peek(t, sizeof(t), p, sizeof(p), &rtn)) {
+                if (_mqttClient.publish(t, p, rtn)) {
                     _offlineBuffer.consume();
                 } else break;
             } else break;
@@ -249,6 +300,7 @@ String MQTTService::getResetReason() {
 }
 
 void MQTTService::publishDiscovery() {
+    ClientLock lock(_clientMutex);
     String baseSensor = "homeassistant/sensor/" + String(_deviceId);
     String baseBinary = "homeassistant/binary_sensor/" + String(_deviceId);
 
@@ -262,9 +314,10 @@ void MQTTService::publishDiscovery() {
         dev["sw"] = FW_VERSION;
     };
 
-    // Bezpečný publish — pokud payload nevejde do bufferu, dočasně ho zvětší.
-    // PubSubClient::setBufferSize realokuje, ale neopouští buffer při publish, takže
-    // se zvětšení musí udělat PŘEDEM. Po každé publishi se vrací zpět na 512.
+    // Safe publish: if the payload does not fit the buffer, temporarily enlarge it.
+    // PubSubClient::setBufferSize reallocates but does not keep the buffer during a
+    // publish, so the enlargement must be done BEFOREHAND. After each publish the
+    // buffer is restored to 512.
     auto safePublish = [&](const char* topic, const char* payload, bool retained) -> bool {
         size_t needed = strlen(topic) + strlen(payload) + 8; // 5B fixed header + slack
         uint16_t cur = _mqttClient.getBufferSize();
@@ -314,7 +367,10 @@ void MQTTService::publishDiscovery() {
     pub("IP Address", "ip", _topics.ip, "", "", "mdi:ip-network", true, baseSensor);
     pub("Tamper Status", "tamper", _topics.tamper, "", "", "mdi:shield-alert", false, baseSensor);
 
+#ifdef ENABLE_MQTT_ALARM_COMMANDS
     // --- HA ALARM CONTROL PANEL ---
+    // Only advertised when remote MQTT alarm control is enabled — otherwise HA would
+    // show a control-panel entity whose ARM/DISARM commands are ignored.
     {
         JsonDocument doc;
         doc["name"] = "Security Alarm";
@@ -334,6 +390,7 @@ void MQTTService::publishDiscovery() {
         String configTopic = "homeassistant/alarm_control_panel/" + String(_deviceId) + "_alarm/config";
         safePublish(configTopic.c_str(), p.c_str(), true);
     }
+#endif
 
     // --- BINARY SENSORS ---
     pub("Zone Occupancy", "occupancy", _topics.presence_state, "", "occupancy", "", false, baseBinary, "Detected", "Clear");
@@ -351,8 +408,9 @@ void MQTTService::publishDiscovery() {
 }
 
 void MQTTService::publishHealth(const char* healthStatus, bool radarOk, bool wifiOk, bool heapOk, bool mqttOk) {
+    ClientLock lock(_clientMutex);
     if (!_mqttClient.connected()) return;
-    
+
     JsonDocument doc;
     doc["status"] = healthStatus;
     doc["radar_ok"] = radarOk;
@@ -415,6 +473,7 @@ void MQTTService::checkCertificateExpiry() {
                   
     if(days_left < 30) {
         Serial.println("[Cert] ⚠️ WARNING: Certificate expires soon!");
+        ClientLock lock(_clientMutex);
         if(_mqttClient.connected()) {
             _mqttClient.publish(_topics.notification, "WARNING: SSL certificate expiring soon!", true);
         }

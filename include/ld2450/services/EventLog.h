@@ -5,6 +5,8 @@
 #include <ArduinoJson.h>
 #include <FS.h>
 #include <LittleFS.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 // EventType enum is in types.h
 
@@ -32,7 +34,7 @@ public:
 
 private:
     void loadFromDisk();
-    void saveToDisk();
+    bool saveToDisk();
 
     LogEvent* _buffer;
     size_t _capacity;
@@ -42,6 +44,12 @@ private:
     bool _dirty;
     unsigned long _lastFlush;
     const char* _filename = "/events.bin";
+
+    // CON-01: addEvent() runs from the main loop, the Telegram task, and async
+    // HTTP callbacks (via setArmed->triggerAlert), while getEventsJSON()/clear()
+    // run from HTTP callbacks and flush() from the loop. Serialize all buffer
+    // access so a concurrent add can't corrupt the ring or a JSON read.
+    SemaphoreHandle_t _mutex = nullptr;
 };
 
 #endif

@@ -6,8 +6,8 @@ Only the latest release on `main` receives security fixes.
 
 | Version | Supported |
 |---------|-----------|
-| v5.7.x (latest) | Yes |
-| < v5.7 | No |
+| v5.8.x (latest) | Yes |
+| < v5.8 | No |
 
 ## Reporting a Vulnerability
 

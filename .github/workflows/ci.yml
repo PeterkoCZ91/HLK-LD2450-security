@@ -36,6 +36,9 @@ jobs:
       - name: Build firmware
         run: pio run -e ld2450_release
 
+      - name: Build OTA variant
+        run: ARDUINO_OTA_PASSWORD=ci-build-check pio run -e ld2450_ota
+
   test:
     runs-on: ubuntu-latest
 

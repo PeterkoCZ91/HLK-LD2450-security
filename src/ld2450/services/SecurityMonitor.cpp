@@ -1,6 +1,8 @@
 #include "services/SecurityMonitor.h"
 #include "services/MQTTService.h"
 #include "services/EventLog.h"
+#include "ld2450/utils/timing.h"
+#include "ld2450/utils/sched_edge.h"
 
 SecurityMonitor::SecurityMonitor() {}
 
@@ -29,10 +31,10 @@ void SecurityMonitor::update() {
         checkSystemHealth();
     }
 
-    // Exit delay: ARMING -> ARMED  (chráněno mutexem proti Telegram setArmed)
+    // Exit delay: ARMING -> ARMED  (protected by mutex against Telegram setArmed)
     const char* transitionMsg = nullptr;
     if (_stateMutex) xSemaphoreTake(_stateMutex, portMAX_DELAY);
-    if (_alarmState == SecurityState::ARMING && now - _exitDelayStart >= _exitDelay) {
+    if (_alarmState == SecurityState::ARMING && ld2450_timing::elapsedAtLeast(now, _exitDelayStart, _exitDelay)) {
         _alarmState = SecurityState::ARMED;
         Serial.println("[SecMon] ARMED (exit delay expired)");
         transitionMsg = "ARMED - exit delay completed";
@@ -40,7 +42,7 @@ void SecurityMonitor::update() {
     // TRIGGERED timeout -> auto-silence
     bool fireSilenceMsg = false;
     const char* silenceMsg = nullptr;
-    if (_alarmState == SecurityState::TRIGGERED && _triggerTimeout > 0 && now - _triggerStartTime >= _triggerTimeout) {
+    if (_alarmState == SecurityState::TRIGGERED && _triggerTimeout > 0 && ld2450_timing::elapsedAtLeast(now, _triggerStartTime, _triggerTimeout)) {
         deactivateSiren();
         if (_autoRearm) {
             _alarmState = SecurityState::ARMED;
@@ -68,9 +70,11 @@ void SecurityMonitor::update() {
     if (_mqttService && _mqttService->connected()) {
         static SecurityState lastPublished = SecurityState::DISARMED;
         if (_alarmState != lastPublished || _forceRepublish) {
-            _mqttService->publish(_mqttService->getTopics().alarm_state, getAlarmStateStr(), true);
-            lastPublished = _alarmState;
-            _forceRepublish = false;
+            // Mark as sent only on success so a dropped publish is retried.
+            if (_mqttService->publish(_mqttService->getTopics().alarm_state, getAlarmStateStr(), true)) {
+                lastPublished = _alarmState;
+                _forceRepublish = false;
+            }
         }
     }
 }
@@ -78,8 +82,7 @@ void SecurityMonitor::update() {
 void SecurityMonitor::setArmed(bool armed, bool immediate, bool homeMode) {
     unsigned long now = millis();
 
-    // Mutex chrání proti cross-core race (Telegram task vs loop task).
-    // Bez něj by NVS putBool a state mutace kolidovaly.
+    // Mutex protects against cross-core races (Telegram task vs loop task).
     if (_stateMutex) xSemaphoreTake(_stateMutex, portMAX_DELAY);
 
     bool stateChanged = false;
@@ -121,15 +124,18 @@ void SecurityMonitor::setArmed(bool armed, bool immediate, bool homeMode) {
         }
     }
 
-    if (_stateMutex) xSemaphoreGive(_stateMutex);
-
-    // NVS / MQTT mimo lock — Preferences API je sice non-thread-safe, ale teď se serializuje
-    // pouze přes _stateMutex (volající z Telegram tasku ho čeká také). Drží se tedy invariant
-    // "1 setArmed in flight" — putBool níže je tím chráněno.
-    if (_prefs) {
+    // SECSTATE-01: persist INSIDE the state lock so the NVS write order can
+    // never diverge from the in-RAM state mutation order. Persist the
+    // resulting state (derived from this call), not a stale read.
+    if (stateChanged && _prefs) {
         _prefs->putBool("sec_armed", armed);
         _prefs->putBool("sec_home", homeMode && armed);
     }
+
+    if (_stateMutex) xSemaphoreGive(_stateMutex);
+
+    // Network/notification work happens OUTSIDE the state lock (lock ordering:
+    // never call into Telegram/MQTT while holding _stateMutex).
     if (alertMsg) triggerAlert(EVT_SECURITY, alertMsg);
 }
 
@@ -205,10 +211,13 @@ void SecurityMonitor::processTargets(uint8_t targetCount, const LD2450Target tar
         _entryDelayStart = now;
         fireEntry = true;
     }
-    else if (_alarmState == SecurityState::PENDING && now - _entryDelayStart >= _entryDelay) {
+    else if (_alarmState == SecurityState::PENDING && ld2450_timing::elapsedAtLeast(now, _entryDelayStart, _entryDelay)) {
         _alarmState = SecurityState::TRIGGERED;
         _triggerStartTime = now;
         fireTrigger = true;
+        // Siren must switch on in the same critical section as the state change,
+        // otherwise a concurrent setArmed(false) could leave it stuck ON.
+        activateSiren();
     }
     if (_stateMutex) xSemaphoreGive(_stateMutex);
 
@@ -227,7 +236,6 @@ void SecurityMonitor::processTargets(uint8_t targetCount, const LD2450Target tar
             alertMsg += buf;
         }
         triggerAlert(EVT_SECURITY, alertMsg.c_str());
-        activateSiren();
     }
 
     // Track presence while disarmed (for reminder)
@@ -252,7 +260,7 @@ void SecurityMonitor::checkRSSIAnomaly(long currentRSSI) {
 
     long rssiDelta = _lastRSSI - currentRSSI;
     if (rssiDelta > _rssiDropThreshold && _rssiBaselineEstablished) {
-        if (now - _lastWiFiAnomalyAlert > COOLDOWN_WIFI_ANOMALY_MS) {
+        if (ld2450_timing::cooldownElapsed(now, _lastWiFiAnomalyAlert, COOLDOWN_WIFI_ANOMALY_MS)) {
             triggerAlert(EVT_WIFI, "RSSI drop detected");
             _lastWiFiAnomalyAlert = now;
             _lastEvent.wifi_jamming_detected = true;
@@ -263,7 +271,7 @@ void SecurityMonitor::checkRSSIAnomaly(long currentRSSI) {
     if (currentRSSI < _rssiThreshold) {
         if (_lowRssiStartTime == 0) _lowRssiStartTime = now;
         if (now - _lowRssiStartTime > TIMEOUT_LOW_RSSI_SUSTAINED_MS) {
-            if (!_lastEvent.low_rssi && now - _lastWiFiAnomalyAlert > COOLDOWN_WIFI_ANOMALY_MS) {
+            if (!_lastEvent.low_rssi && ld2450_timing::cooldownElapsed(now, _lastWiFiAnomalyAlert, COOLDOWN_WIFI_ANOMALY_MS)) {
                 triggerAlert(EVT_WIFI, "WiFi signal unstable (sustained)");
                 _lastWiFiAnomalyAlert = now;
                 _lastEvent.low_rssi = true;
@@ -282,7 +290,7 @@ void SecurityMonitor::checkTamperState(bool isTamper) {
 
     if (isTamper && !_lastTamperState) {
         _tamperStartTime = now;
-        if (now - _lastTamperAlert > COOLDOWN_TAMPER_ALERT_MS) {
+        if (ld2450_timing::cooldownElapsed(now, _lastTamperAlert, COOLDOWN_TAMPER_ALERT_MS)) {
             triggerAlert(EVT_TAMPER, "TAMPER detected!");
             _lastTamperAlert = now;
             _lastEvent.tamper_detected = true;
@@ -305,7 +313,7 @@ void SecurityMonitor::checkRadarHealth(bool isConnected) {
     }
 
     if (!isConnected && (now - _radarDisconnectedTime > TIMEOUT_RADAR_DISCONNECT_MS)) {
-        if (now - _lastRadarAlert > COOLDOWN_RADAR_ALERT_MS) {
+        if (ld2450_timing::cooldownElapsed(now, _lastRadarAlert, COOLDOWN_RADAR_ALERT_MS)) {
             triggerAlert(EVT_SYSTEM, "Radar connection lost");
             _lastRadarAlert = now;
             _lastEvent.radar_disconnected = true;
@@ -333,12 +341,17 @@ void SecurityMonitor::checkSystemHealth() {
         }
     }
 
-    // Certificate check (once per day)
-    static unsigned long lastCertCheck = 0;
-    unsigned long now = millis();
-    if (_mqttService && _mqttService->connected() && (now - lastCertCheck > INTERVAL_CERT_CHECK_MS)) {
+    // Certificate check: first run as soon as time is valid (non-blocking test,
+    // so getLocalTime inside the check returns immediately), then once per day.
+    static uint32_t lastCertCheck = 0;
+    static bool certEverChecked = false;
+    uint32_t now = millis();
+    bool timeValid = time(nullptr) > 1700000000;
+    if (_mqttService && _mqttService->connected() &&
+        ld2450_sched::certCheckDue(now, lastCertCheck, certEverChecked, INTERVAL_CERT_CHECK_MS, timeValid)) {
         _mqttService->checkCertificateExpiry();
         lastCertCheck = now;
+        certEverChecked = true;
     }
 
     _systemHealthy = healthy;
@@ -362,8 +375,8 @@ void SecurityMonitor::triggerAlert(uint8_t eventType, const String& message) {
 
 void SecurityMonitor::recordApproach(uint8_t targetIdx, const LD2450Target& t, uint8_t totalCount) {
     ApproachEntry& e = _approachLog[_approachHead];
-    // Pokud je NTP synchronizováno, ukládáme epoch unix time; jinak fallback uptime sec.
-    // Konzistentní význam s isoTime (oboje walltime, nebo oboje uptime).
+    // If NTP is synchronized store epoch unix time, otherwise fall back to uptime seconds.
+    // Same meaning as isoTime (both wall time, or both uptime).
     time_t epoch = time(nullptr);
     if (epoch > 1700000000) {
         e.timestamp = (uint32_t)epoch;

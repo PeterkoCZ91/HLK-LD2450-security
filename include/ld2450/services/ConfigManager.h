@@ -20,10 +20,8 @@ struct SystemConfig {
     bool mqtt_tls = false;
     bool led_enabled = true;
     uint16_t startup_led_sec = 120;
-    // LD2450-specific (no gate config, but zone config)
-    int16_t zone_x_min = -4000;
-    int16_t zone_x_max = 4000;
-    int16_t zone_y_max = 8000;
+    // Zone bounds/thresholds live in the unified z_* NVS schema owned by
+    // ld2450_zones (CFG-02), not here; the old zone_x* duplicates were removed.
     // Schedule
     char sched_arm_time[6] = "";
     char sched_disarm_time[6] = "";
@@ -31,9 +29,12 @@ struct SystemConfig {
     // Day/Night zone profile schedule (HH:MM). Empty = always day profile.
     char night_start_time[6] = "";
     char night_end_time[6] = "";
+    // POSIX TZ string for local time / DST (TIME-01). Default = Central European
+    // Time with EU DST rules. configTzTime() applies this to NTP-synced time.
+    char timezone[40] = "CET-1CEST,M3.5.0,M10.5.0/3";
 
     // Native LD2450 region filter (cmd 0xC2). Mode 0=disabled, 1=detect-only, 2=exclude.
-    // Pole drží 3 zóny × {x1,y1,x2,y2} → 12 int16. Ukládáno do NVS jako blob "rf_zones".
+    // Array holds 3 zones x {x1,y1,x2,y2} = 12 int16. Stored in NVS as blob "rf_zones".
     uint8_t region_filter_mode = 0;
     int16_t region_filter_zones[12] = {0};
 };

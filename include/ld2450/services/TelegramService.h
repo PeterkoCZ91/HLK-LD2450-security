@@ -32,6 +32,7 @@ public:
 
     bool isEnabled() const { return _enabled; }
     bool isConnected() const { return _connected; }
+    const char* getStatus() const { return _lastStatus; }
 
 private:
     static void telegramTaskFunc(void* param);
@@ -42,13 +43,15 @@ private:
 
     WiFiClientSecure _client;
     AsyncTelegram2* _bot;
-    Preferences* _prefs;
+    Preferences* _prefs = nullptr;  // null until begin() (offline/deferred boot)
     LD2450Service* _radar = nullptr;
     SecurityMonitor* _secMon = nullptr;
     volatile bool* _shouldReboot = nullptr;
 
     char _token[64];
     char _chatId[24];
+    char _allowedSenderId[24];
+    char _lastStatus[48] = "idle";
     bool _enabled;
     bool _connected;
 

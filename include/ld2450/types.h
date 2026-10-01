@@ -170,7 +170,7 @@ struct TargetHistory {
     int16_t posXHistory[3][10] = {}; // Ring buffer for last 10 X positions
     int16_t posYHistory[3][10] = {}; // Ring buffer for last 10 Y positions
     uint8_t historyIdx[3] = {0};
-    uint8_t varSamples[3] = {0}; // Skutečný počet záznamů, dokud nedosáhne 10 (cold-start fix)
+    uint8_t varSamples[3] = {0}; // Actual sample count until it reaches 10 (cold-start fix)
     float variance[3] = {0};    // Calculated motion variance
     
     // EKF Trackers (one per target slot, state: [x,y,vx,vy])

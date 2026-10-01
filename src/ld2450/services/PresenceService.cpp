@@ -1,5 +1,6 @@
 #include "ld2450/services/PresenceService.h"
 #include "ld2450/utils/TargetAssociation.h"
+#include "ld2450/utils/presence_logic.h"
 
 extern void safeRestart(const char* reason);
 
@@ -129,7 +130,7 @@ bool PresenceService::isInBlackoutZone(int16_t x, int16_t y) {
 
 void PresenceService::processNoiseLearning(unsigned long now) {
     if (_ctx->noiseMap && _ctx->noiseMap->pending) {
-        if (now >= _ctx->noiseMap->learningStartTs) {
+        if (ld2450_presence::timeReached((uint32_t)now, (uint32_t)_ctx->noiseMap->learningStartTs)) {
             _ctx->noiseMap->pending = false;
             _ctx->noiseMap->learning = true;
             _ctx->noiseMap->startTime = now;
@@ -240,16 +241,17 @@ void PresenceService::checkRSSIAnomaly(unsigned long now) {
     if (now - _lastRSSICheck < 60000) return;
     _lastRSSICheck = now;
 
+    if (WiFi.status() != WL_CONNECTED) return; // RSSI()==0 when offline would poison the EMA baseline
     long currentRSSI = WiFi.RSSI();
-    // Maintain EMA baseline pro UI/diagnostics
+    // Maintain EMA baseline for UI/diagnostics
     if (_ctx->netQuality->rssiBaseline == 0) {
         _ctx->netQuality->rssiBaseline = currentRSSI;
         return;
     }
     _ctx->netQuality->rssiBaseline = (_ctx->netQuality->rssiBaseline * 9 + currentRSSI) / 10;
 
-    // Vlastní detekci anomálií / alertování deleguj na SecurityMonitor (jediný owner).
-    // Předtím tu byla duplicitní logika.
+    // Anomaly detection / alerting is delegated to SecurityMonitor (single owner).
+    // Duplicate logic used to live here.
     if (_ctx->security) {
         _ctx->security->checkRSSIAnomaly(currentRSSI);
     }
@@ -260,12 +262,14 @@ void PresenceService::processRadarData(unsigned long now) {
     bool currentTargetValid[3] = {false};
 
     // === TARGET ASSOCIATION ===
-    // Read raw detections and match to existing tracks by proximity
+    // Read raw detections and match to existing tracks by proximity.
+    // RAD-02: one atomic snapshot so all three slots come from the same frame.
     LD2450Target rawDet[3];
+    uint8_t snapCount = 0;
+    _ctx->radar->getSnapshot(rawDet, snapCount);
     float detX[3], detY[3];
     bool detValid[3];
     for (int i = 0; i < 3; i++) {
-        rawDet[i] = _ctx->radar->getTarget(i);
         if (rawDet[i].valid) applyRotation(rawDet[i].x, rawDet[i].y);
         detX[i] = rawDet[i].x;
         detY[i] = rawDet[i].y;
@@ -305,10 +309,10 @@ void PresenceService::processRadarData(unsigned long now) {
             gt->staticSince[i] = 0;
             gt->isGhost[i] = false;
             gt->inZone[i] = false;
-            // Reset variance — slot může být ihned re-použit pro jiný cíl
+            // Reset variance - slot may be reused immediately for another target
             th->varSamples[i] = 0;
             th->historyIdx[i] = 0;
-            // Reset tripwire side — jinak hrozí false count při re-detekci na opačné straně
+            // Reset tripwire side - otherwise re-detection on the opposite side causes a false count
             if (_ctx->tripwire) _ctx->tripwire->lastSide[i] = 0;
             // Reset analytics dwell
             if (_ctx->analytics) {
@@ -347,7 +351,7 @@ void PresenceService::processRadarData(unsigned long now) {
                         break;
                     }
                 }
-                // Pokud žádný polygon není aktivní v aktuálním profilu — chovej se jakoby polygon filtr neexistoval.
+                // If no polygon is active in the current profile, behave as if the polygon filter did not exist.
                 // If already in zone (hysteresis), allow being slightly outside polygon.
                 if (anyActive && !inPoly && !gt->inZone[i]) {
                     gt->isGhost[i] = true;
@@ -534,8 +538,10 @@ void PresenceService::processRadarData(unsigned long now) {
             targets[i].valid = currentTargetValid[i];
             targets[i].x = _ctx->targetHistory->smoothX[i];
             targets[i].y = _ctx->targetHistory->smoothY[i];
-            targets[i].speed = _ctx->radar->getTarget(i).speed;
-            targets[i].resolution = _ctx->radar->getTarget(i).resolution;
+            // RAD-02: speed/resolution come from the SAME associated frame slot
+            // as the smoothed position, not a fresh (possibly different) frame.
+            targets[i].speed = assocTargets[i].speed;
+            targets[i].resolution = assocTargets[i].resolution;
         }
         _ctx->security->processTargets(validCount, targets);
         _ctx->security->checkRadarHealth(_ctx->radar->isConnected());
@@ -577,17 +583,13 @@ void PresenceService::handleTamperDetection(uint8_t validCount, bool* currentTar
         }
     }
     
-    if (validCount > 0) {
-        // Auto-clear tamper if valid targets visible for >5s
-        if (ts->tamperDetected && (now - ts->lastTargetSeen > 5000)) {
-            ts->tamperDetected = false;
-             if (_ctx->mqtt->connected()) _ctx->mqtt->publish(_ctx->mqtt->getTopics().tamper, "OK", false);
-        }
-        ts->lastTargetSeen = now; // update AFTER tamper check
-    } else if (ts->tamperDetected && (now - ts->lastTargetSeen > 10000)) {
+    // Auto-clear: targets continuously visible >5s, or no targets for >10s.
+    if (_tamperClear.update(ts->tamperDetected, validCount, (uint32_t)now,
+                            (uint32_t)ts->lastTargetSeen, 5000, 10000)) {
         ts->tamperDetected = false;
         if (_ctx->mqtt->connected()) _ctx->mqtt->publish(_ctx->mqtt->getTopics().tamper, "OK", false);
     }
+    if (validCount > 0) ts->lastTargetSeen = now;
 }
 
 void PresenceService::updateStateMachine(uint8_t validCount, unsigned long now) {
@@ -757,11 +759,11 @@ void PresenceService::updateVariance(int idx, int16_t x, int16_t y) {
     th->historyIdx[idx] = (th->historyIdx[idx] + 1) % 10;
     if (th->varSamples[idx] < 10) th->varSamples[idx]++;
 
-    // Použij pouze tolik vzorků, kolik jich reálně máme (cold-start fix — předtím
-    // se 10dílá od první detekce, falešně podhodnotila variance → falešný ghost)
+    // Use only as many samples as we really have (cold-start fix - dividing by 10
+    // from the first detection underestimated variance and caused false ghosts)
     uint8_t n = th->varSamples[idx];
     if (n < 3) {
-        // Nedostatek dat — nech vysokou variance, aby cíl nebyl předčasně označen jako ghost
+        // Not enough data - keep variance high so the target is not marked as ghost prematurely
         th->variance[idx] = 1000.0f;
         return;
     }
@@ -792,7 +794,7 @@ void PresenceService::updateAdaptiveFilter(unsigned long now) {
     if (now - _ctx->adaptiveConfig->lastDecay > _ctx->adaptiveConfig->decayInterval) {
         _ctx->adaptiveConfig->lastDecay = now;
         
-        if (!_ctx->noiseMap->active) return;
+        if (!_ctx->noiseMap || !_ctx->noiseMap->active) return;
         
         bool changed = false;
         

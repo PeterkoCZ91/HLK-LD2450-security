@@ -22,9 +22,9 @@ cp include/ld2450/known_devices.h.example include/ld2450/known_devices.h
 
 | Command | Description |
 |---------|-------------|
-| `pio run -e ld2450_lab` | Build for USB flash (development) |
-| `pio run -e ld2450_lab --target upload` | Flash via USB |
-| `pio run -e ld2450_prod --target upload` | Flash via OTA (set IP in platformio.ini first) |
+| `pio run -e ld2450_release` | Build the firmware |
+| `pio run -e ld2450_release --target upload` | Flash via USB |
+| `pio run -e ld2450_ota --target upload` | Flash via OTA (set IP in platformio.ini and export `ARDUINO_OTA_PASSWORD` first) |
 | `pio test -e native` | Run parser regression tests (no hardware needed) |
 
 ---
@@ -55,7 +55,7 @@ Work from `main`. PRs merge back to `main`.
 ## What to Test Before Opening a PR
 
 - `pio test -e native` passes (16/16)
-- `pio run -e ld2450_lab` builds cleanly (zero errors, ideally zero warnings)
+- `pio run -e ld2450_release` builds cleanly (zero errors, ideally zero warnings)
 - If you touched the web UI (`web_interface.h`): verify in a browser, both CS and EN language modes
 - If you touched MQTT topics or HA auto-discovery: verify entities appear correctly in Home Assistant
 - If you touched the alarm state machine: manually exercise DISARMED → ARMING → ARMED → PENDING → TRIGGERED
@@ -95,7 +95,7 @@ This is an embedded C++ project targeting ESP32 Arduino. Follow the conventions 
 ## Submitting a Pull Request
 
 1. Fork and create a branch from `main`
-2. Make your changes, run `pio test -e native` and `pio run -e ld2450_lab`
+2. Make your changes, run `pio test -e native` and `pio run -e ld2450_release`
 3. Open a PR against `main` using the PR template
 4. Describe **what** changed and **why** — hardware constraints or protocol quirks that aren't obvious from the code belong in the PR description, not inline comments
 

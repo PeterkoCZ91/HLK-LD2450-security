@@ -9,6 +9,8 @@
 **Multi-target intrusion detection system** built on ESP32 + HLK-LD2450 24 GHz mmWave radar. Real-time 2D target tracking with Kalman filtering, polygon detection zones, ghost suppression via background calibration, full alarm state machine, Home Assistant integration, Telegram bot, and a dark-mode bilingual (CS/EN) web dashboard with live radar map. No cloud required.
 
 > [!TIP]
+> **New in v5.8** -- Security hardening and reliability release: authenticated, size-limited and validated config/region uploads, stricter web API input checks, fixes for alarm/siren state handling, tamper release, scheduler and MQTT offline buffering, LittleFS no longer auto-formats on a single mount failure, and 119 host-side unit tests. See [CHANGELOG](CHANGELOG.md).
+>
 > **New in v5.7** -- Native hardware region filter (radar-side cmd 0xC2), day/night zone profiles with per-zone activity masks, bilingual web UI (CS/EN), regression test suite for the radar parser (16 unit tests), and a refactored route layer for cleaner endpoint code.
 
 ---
@@ -198,7 +200,7 @@ States: **DISARMED** -> **ARMING** (exit delay) -> **ARMED** -> **PENDING** (ent
 | Telegram bot | 7 commands: arm, disarm, arm_now, status, mute, unmute, restart |
 | BLE configuration | NimBLE peripheral for mobile setup (passkey-protected) |
 | WiFi failover | Backup SSID with automatic reconnection |
-| OTA updates | Web-based and ArduinoOTA firmware upload, optional MD5 hash check |
+| OTA updates | Web-based firmware upload with optional MD5 hash check; ArduinoOTA is opt-in (build flag + password from the environment) |
 | Dead Man's Switch | Auto-restart if no MQTT publish for 10 min (max 3 restarts, then degraded local-only mode) |
 
 ### :bar_chart: Diagnostics
@@ -480,7 +482,13 @@ The two projects share the same alarm state machine, security architecture, and 
 | Hardware region filter | :white_check_mark: Done | LD2450 cmd 0xC2: 3 rectangular zones, radar-side filtering (v5.7) |
 | Day / night zone profiles | :white_check_mark: Done | Per-zone HH:MM masks for day-only, night-only, or both (v5.7) |
 | Bilingual web UI | :white_check_mark: Done | Czech / English toggle, persisted in localStorage (v5.7) |
-| Parser regression tests | :white_check_mark: Done | 16 host-side unit tests (`pio test -e native`) (v5.7) |
+| Security hardening | :white_check_mark: Done | Authenticated bounded uploads, input validation, opt-in ArduinoOTA (v5.8) |
+| Reliability fixes | :white_check_mark: Done | Alarm/siren, scheduler, MQTT offline buffer, safe LittleFS handling (v5.8) |
+| Host-side unit tests | :white_check_mark: Done | 119 tests for parser and utility logic (`pio test -e native`) (v5.8) |
+| Signed releases | :construction: In progress | Signed tag + signed checksums via `tools/release.sh`, see `RELEASING.md` |
+| Encrypted management path | :bulb: Planned | HTTPS or reverse-proxy/VPN guidance instead of plain HTTP Basic Auth |
+| Secure Boot / flash encryption | :bulb: Planned | Signed OTA images, NVS and flash encryption |
+| Parser regression tests | :white_check_mark: Done | 16 host-side unit tests for the radar parser (v5.7) |
 | Scheduled arm/disarm | :white_check_mark: Done | Time-based auto arm/disarm + inactivity auto-arm (v5.5) |
 | MQTT offline buffer | :white_check_mark: Done | LittleFS ring buffer, 30 messages, survives reboot (v5.5) |
 | Entry/exit counter | :white_check_mark: Done | Virtual tripwire line with directional counting (v5.5) |
@@ -552,8 +560,10 @@ pio run -e ld2450_release
 # Flash via USB
 pio run -e ld2450_release --target upload
 
-# Flash via OTA (change IP in platformio.ini first)
-pio run -e ld2450_prod --target upload
+# Flash via OTA (change IP in platformio.ini first; the OTA password comes
+# from the environment and is never committed)
+export ARDUINO_OTA_PASSWORD='choose-a-unique-password'
+pio run -e ld2450_ota --target upload
 ```
 
 ### Build Environments
@@ -561,17 +571,16 @@ pio run -e ld2450_prod --target upload
 | Environment | Board | Upload | Use case |
 |-------------|-------|--------|----------|
 | `ld2450_release` | ESP32-WROOM | USB | Pre-built release, captive portal, MQTTS |
-| `ld2450_lab` | ESP32-WROOM | USB | Development with compile-time WiFi, no web auth |
-| `ld2450_prod` | ESP32-WROOM | OTA | Production deployment |
-| `native` | host | -- | Parser regression tests (`pio test -e native`) |
+| `ld2450_ota` | ESP32-WROOM | OTA | Same firmware as `ld2450_release` plus opt-in ArduinoOTA (needs `ARDUINO_OTA_PASSWORD`) |
+| `native` | host | -- | Host-side unit tests (`pio test -e native`) |
 
-### Parser Unit Tests
+### Unit Tests
 
 ```bash
 pio test -e native
 ```
 
-The `native` environment compiles the radar frame parser against Unity test framework and runs 16 host-side regression tests covering: valid CSRON frames (single/multi target), origin-target with non-zero resolution (HLK firmware v2.14), trailing garbage handling, header-byte-inside-payload anti-false-match, and back-to-back frame parsing. No ESP32 hardware needed.
+The `native` environment compiles the radar frame parser and the pure-logic helpers in `include/ld2450/utils` against the Unity test framework and runs 119 host-side tests (no ESP32 hardware needed). The parser suite covers: valid CSRON frames (single/multi target), origin-target with non-zero resolution (HLK firmware v2.14), trailing garbage handling, header-byte-inside-payload anti-false-match, and back-to-back frame parsing. No ESP32 hardware needed.
 
 ### Multi-Device OTA
 

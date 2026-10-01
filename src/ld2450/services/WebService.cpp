@@ -1,6 +1,7 @@
 #include "ld2450/services/WebService.h"
 #include "ld2450/services/TelegramService.h"
 #include "ld2450/services/ConfigManager.h"
+#include "ld2450/utils/csrf_check.h"
 #include <time.h>
 #include "ld2450/web_interface.h"
 
@@ -36,14 +37,12 @@ void WebService::setupSSE() {
     _events->onConnect([](AsyncEventSourceClient *client) {
         client->send("connected", "status", millis());
     });
-    // Vyžaduj basic-auth (LAB_MODE skipne, viz níže)
-#if LAB_MODE != 1
+    // Require basic-auth on the SSE stream
     if (strlen(_ctx->authUser) > 0 && strlen(_ctx->authPass) > 0) {
         _events->setAuthentication(_ctx->authUser, _ctx->authPass, AsyncAuthType::AUTH_BASIC);
     } else {
         _events->setAuthentication("admin", "admin", AsyncAuthType::AUTH_BASIC);
     }
-#endif
     _server->addHandler(_events);
 }
 
@@ -54,23 +53,42 @@ void WebService::sendSSE(const String& event, const String& data) {
 }
 
 
-bool WebService::requireAuth(AsyncWebServerRequest *r) {
-    #if LAB_MODE == 1
-      return true; // Skip in LAB mode
-    #endif
-    
+// No-challenge credential check. Safe to call inside upload/body callbacks where
+// sending an HTTP challenge is not possible — returns the decision without side
+// effects so the caller can silently reject unauthorized chunks.
+bool WebService::checkAuth(AsyncWebServerRequest *r) {
     if (strlen(_ctx->authUser) == 0 || strlen(_ctx->authPass) == 0) {
-      Serial.println("[Web] WARNING: Empty credentials — using default auth");
-      if (!r->authenticate("admin", "admin")) {
+      return r->authenticate("admin", "admin");
+    }
+    return r->authenticate(_ctx->authUser, _ctx->authPass);
+}
+
+// SEC-06: reject cross-origin browser requests on state-changing methods. The
+// decision itself lives in ld2450::csrfAllowed (host-testable); here we just pull
+// the relevant headers out of the request.
+bool WebService::checkCsrf(AsyncWebServerRequest *r) {
+    WebRequestMethodComposite m = r->method();
+    bool mutating = !(m == HTTP_GET || m == HTTP_HEAD || m == HTTP_OPTIONS);
+
+    const AsyncWebHeader* hostHdr = r->getHeader("Host");
+    const AsyncWebHeader* origin  = r->getHeader("Origin");
+    const AsyncWebHeader* referer = r->getHeader("Referer");
+
+    return ld2450::csrfAllowed(
+        mutating,
+        hostHdr ? hostHdr->value().c_str() : nullptr,
+        origin  ? origin->value().c_str()  : nullptr,
+        referer ? referer->value().c_str() : nullptr);
+}
+
+bool WebService::requireAuth(AsyncWebServerRequest *r) {
+    if (!checkAuth(r)) {
         r->requestAuthentication();
         return false;
-      }
-      return true;
     }
-    
-    if (!r->authenticate(_ctx->authUser, _ctx->authPass)) {
-      r->requestAuthentication();
-      return false;
+    if (!checkCsrf(r)) {
+        r->send(403, "text/plain", "CSRF check failed: cross-origin request blocked");
+        return false;
     }
     return true;
 }

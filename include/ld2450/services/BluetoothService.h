@@ -18,6 +18,10 @@ public:
     bool isRunning() const { return _isRunning; }
 
 private:
+    // SEC-03: per-device BLE pairing passkey. Generated once on first boot, stored in
+    // NVS, printed to Serial — replaces the fixed compiled-in passkey.
+    uint32_t getOrCreatePasskey();
+
     ConfigManager* _config = nullptr;
     bool _isRunning = false;
     uint32_t _timeoutSeconds = 300; // 5 minutes (frees heap for Telegram SSL)

@@ -104,8 +104,8 @@ private:
     EventLog* _eventLog = nullptr;
     Preferences* _prefs = nullptr;
 
-    // Mutex chrání alarm state mutace mezi loop tasem (Core 1) a Telegram taskem (Core 0).
-    // Bez něj může setArmed() z Telegramu kolidovat s update() / mqttCallback z hlavní smyčky.
+    // Mutex protects alarm state mutations between the loop task (Core 1) and the Telegram task (Core 0).
+    // Without it setArmed() from Telegram could collide with update() / mqttCallback from the main loop.
     SemaphoreHandle_t _stateMutex = nullptr;
 
     // Alarm state

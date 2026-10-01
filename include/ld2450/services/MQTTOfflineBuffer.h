@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include <LittleFS.h>
+#include "ld2450/utils/mqtt_buffer_logic.h"
 
 #define MQTT_OFB_CAPACITY   30
 #define MQTT_OFB_TOPIC_LEN  64
@@ -12,24 +13,34 @@ struct MQTTBufferedMsg {
     uint32_t timestamp;
     char topic[MQTT_OFB_TOPIC_LEN];
     char payload[MQTT_OFB_PAYLOAD_LEN];
+    uint8_t retained;  // MQTT-01: preserve retained flag across buffering/replay
+    uint8_t qos;       // reserved (QoS 0 today) — stored for forward-compatibility
+    uint8_t _pad[2];
 };
 
 class MQTTOfflineBuffer {
 public:
     void begin();
-    void push(const char* topic, const char* payload);
+    // MQTT-01: retained flag is preserved so replayed records keep their
+    // original delivery semantics.
+    bool push(const char* topic, const char* payload, bool retained = false);
     bool hasMessages() const { return _count > 0; }
-    bool peek(char* topic, size_t topicLen, char* payload, size_t payloadLen) const;
+    bool peek(char* topic, size_t topicLen, char* payload, size_t payloadLen,
+              bool* retained = nullptr) const;
     void consume();
     uint32_t count() const { return _count; }
-    // Lazy persist: zavolat z hlavního loop / MQTT update, save proběhne max 1x za SAVE_INTERVAL_MS
+    // Lazy persist: call from the main loop / MQTT update; saves at most once per SAVE_INTERVAL_MS
     void update();
-    // Vynutit okamžitý zápis (např. před restartem)
+    // Force an immediate write (e.g. before a restart)
     void flushNow();
 
 private:
     void loadFromDisk();
-    void saveToDisk();
+    bool saveToDisk();  // MQTT-01: returns success so callers keep _dirty on failure
+
+    // On-disk format (MQTT-01): [magic][version][count][records...][crc32].
+    static constexpr uint32_t OFB_MAGIC = 0x4F464232;   // "OFB2"
+    static constexpr uint8_t  OFB_VERSION = 1;
 
     MQTTBufferedMsg _buf[MQTT_OFB_CAPACITY];
     uint32_t _head  = 0;

@@ -3,6 +3,7 @@
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include "ld2450/types.h"
+#include "ld2450/utils/presence_logic.h"
 #include "services/MQTTService.h"
 #include "services/LD2450Service.h"
 #include "services/SecurityMonitor.h"
@@ -28,6 +29,7 @@ private:
     unsigned long _lastRSSICheck = 0;
     unsigned long _holdStartTime = 0;
     unsigned long _wifiLostSince = 0;
+    ld2450_presence::TamperClear _tamperClear;
     
     PresenceState _currentState = PresenceState::IDLE;
     TelemetryState _tCache;

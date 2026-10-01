@@ -5,6 +5,8 @@
 #include <Preferences.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include "ld2450/types.h"
 #include "ld2450/services/MQTTOfflineBuffer.h"
 #include "secrets.h"
@@ -45,6 +47,9 @@ public:
     const char* getPort() const { return _port; }
     bool isEnabled() const { return _enabled; }
     bool isTlsEnabled() const { return _tlsEnabled; }
+    // SEC-05: true when TLS was requested but the CA is missing/placeholder, so the
+    // service refuses to connect. Surface in diagnostics without leaking secrets.
+    bool isTlsMisconfigured() const { return _tlsMisconfigured; }
     
     // Callback setter wrapper
     void setCallback(MQTT_CALLBACK_SIGNATURE);
@@ -74,7 +79,10 @@ private:
     char _deviceId[32]; // Increased size just in case
     bool _enabled = true;
     bool _tlsEnabled = false;
-    
+    // SEC-05: set when TLS is requested but no valid CA is configured. Connections
+    // are then refused (fail closed) instead of silently downgrading to plaintext.
+    bool _tlsMisconfigured = false;
+
     // State
     bool _bootMsgSent = false;
     unsigned long _lastReconnectAttempt = 0;
@@ -86,6 +94,14 @@ private:
 
     bool _justReconnected = false;
     MQTTOfflineBuffer _offlineBuffer;
+
+    // CON-01: PubSubClient is not reentrant. publish() is reached from the main
+    // loop, the Telegram task, and async HTTP callbacks while update() runs
+    // _mqttClient.loop() on the main loop; concurrent socket I/O corrupts the
+    // connection. This recursive mutex serializes every _mqttClient access.
+    // Recursive because loop() dispatches the inbound command callback, which
+    // can itself publish() (re-entering the same task's lock).
+    SemaphoreHandle_t _clientMutex = nullptr;
 
 public:
     unsigned long getLastSuccessfulPublish() const { return _lastSuccessfulPublish; }

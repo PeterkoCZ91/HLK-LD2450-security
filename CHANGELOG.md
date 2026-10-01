@@ -4,6 +4,31 @@ All notable changes to LD2450 Security are documented here.
 
 ---
 
+## [v5.8.0] — 2026-10-01
+
+### Security
+- Config import and region-filter uploads authenticate before reading the body, enforce size and content-length limits, allow one upload at a time, clean up on disconnect, and validate the whole document before applying it atomically
+- Web API inputs are range-checked (alarm timings, zone/polygon IDs and coordinates, MQTT port, credential length); empty or over-long credentials are rejected instead of being silently truncated
+- ArduinoOTA is opt-in: it needs `-D ENABLE_ARDUINO_OTA` and a password from the `ARDUINO_OTA_PASSWORD` environment variable (builds fail closed without one)
+
+### Fixed
+- Siren could stay on after the alarm was disarmed from another task; exit delay could be skipped by a timer wrap; tamper/radar alerts were suppressed shortly after boot
+- Tamper state was never released while a target stayed visible; noise-map learning start used a wrap-unsafe time comparison; RSSI baseline was skewed while WiFi was disconnected
+- Kalman filter could be permanently poisoned by a single non-finite measurement
+- MQTT: bounded wait on the client lock, retained messages are de-duplicated in the offline buffer, truncated payloads are no longer buffered, and a dropped alarm-state publish is retried
+- EventLog / offline buffer: crash-safe file replacement with boot-time recovery of an interrupted write
+- LittleFS is no longer auto-formatted on a single mount failure (only on first use or after repeated failed boots)
+- Scheduler acts once per scheduled minute so a manual disarm is not undone; Telegram start is retried after a low-memory deferral; WiFi reconnect alternates between primary and backup networks; the event log is flushed before a restart; certificate expiry is checked soon after time sync
+- BLE WiFi provisioning accepts SSIDs containing a comma
+
+### Added
+- 119 host-side unit tests and pure-logic headers under `include/ld2450/utils`
+- `tools/release.sh` and `RELEASING.md` for signed tags and signed checksums
+
+### Changed
+- `pio test -e native` now runs the full test suite
+- Build environments simplified: `ld2450_release` is the firmware; `ld2450_prod` is now `ld2450_ota` (the same firmware plus opt-in ArduinoOTA); `ld2450_lab` and the `LAB_MODE` option are removed, so web authentication and the captive portal can no longer be compiled out
+
 ## [v5.7.6] — 2026-07-15
 
 ### Fixed

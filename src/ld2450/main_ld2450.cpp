@@ -12,7 +12,19 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <ESPAsyncWiFiManager.h>
-#include <ArduinoOTA.h>
+// SEC-02: ArduinoOTA is disabled by default. It only compiles in when the build
+// explicitly opts in with -D ENABLE_ARDUINO_OTA, which in turn requires a unique
+// ARDUINO_OTA_PASSWORD supplied outside source control (see platformio.ini).
+#ifdef ENABLE_ARDUINO_OTA
+  #include <ArduinoOTA.h>
+  #ifndef ARDUINO_OTA_PASSWORD
+    #error "ENABLE_ARDUINO_OTA requires a unique ARDUINO_OTA_PASSWORD (e.g. from an env var); refusing to build with a default/blank OTA password"
+  #endif
+  // Fail closed: an empty password (e.g. an unset env var expanding to "") must not
+  // ship an unauthenticated OTA listener. sizeof("") == 1, so require length >= 1.
+  static_assert(sizeof(ARDUINO_OTA_PASSWORD) > 1,
+                "ARDUINO_OTA_PASSWORD is empty — set the env var before building (export ARDUINO_OTA_PASSWORD=...)");
+#endif
 #include <ESPmDNS.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -21,6 +33,12 @@
 #include "ld2450/types.h"
 #include "ld2450/constants.h"
 #include "ld2450/services/ConfigManager.h"
+#include "ld2450/utils/schedule_time.h"
+#include "ld2450/utils/fs_policy.h"
+#include "ld2450/utils/zone_persist.h"
+#include "ld2450/utils/gpio_allowlist.h"
+#include "ld2450/utils/wifi_retry.h"
+#include "ld2450/utils/sched_edge.h"
 #include "ld2450/services/MQTTService.h"
 #include "ld2450/services/LD2450Service.h"
 #include "ld2450/services/WebService.h"
@@ -67,6 +85,10 @@ volatile bool shouldReboot = false;
 bool telegramDeferred = false;
 static unsigned long _lastUptimeSave = 0;
 static bool _otaValidated = false;
+// OTA-01: the rollback-validation window is measured from the END of setup(), not
+// from reset — a slow captive portal / provisioning must not consume the stability
+// window before the app has actually run.
+static unsigned long _setupCompleteMs = 0;
 
 // --- STATE ---
 NetworkQuality netQuality;
@@ -113,7 +135,7 @@ void safeRestart(const char* reason) {
     String history = p.getString("rst_history", "[]");
     JsonDocument doc;
     DeserializationError derr = deserializeJson(doc, history);
-    // Pokud NVS obsahuje korupci nebo není pole, začni načisto — jinak by arr.add() byl UB.
+    // If NVS content is corrupt or not an array, start fresh - otherwise arr.add() would be UB.
     if (derr != DeserializationError::Ok || !doc.is<JsonArray>()) {
         doc.clear();
         doc.to<JsonArray>();
@@ -135,24 +157,37 @@ void safeRestart(const char* reason) {
     p.putString("rst_history", out);
     p.end();
 
+    eventLog.flushNow();  // dirty events (max 60 s) by jinak restartem zanikly
     delay(100);
     ESP.restart();
 }
 
+// CFG-01: use a short-lived LOCAL Preferences handle for the "ld2450-zones"
+// namespace. The global `preferences` handle stays open on "ld2450_config" for the
+// whole app; calling begin()/end() on it here would repoint or close that shared
+// handle and break every later _ctx->preferences->put* (alarm, schedule, MQTT, …).
 void saveBlackoutZonesFn() {
-    preferences.begin("ld2450-zones", false);
-    preferences.putBytes("blackout", blackoutZones, sizeof(blackoutZones));
-    preferences.putUChar("bz_count", blackoutZoneCount);
-    preferences.putBytes("bz_masks", blackoutMasks, sizeof(blackoutMasks));
-    preferences.end();
+    Preferences p;
+    if (!p.begin("ld2450-zones", false)) {
+        Serial.println("[Zones] ERROR: blackout save failed to open NVS namespace");
+        return;
+    }
+    p.putBytes("blackout", blackoutZones, sizeof(blackoutZones));
+    p.putUChar("bz_count", blackoutZoneCount);
+    p.putBytes("bz_masks", blackoutMasks, sizeof(blackoutMasks));
+    p.end();
 }
 
 void savePolygonsFn() {
-    preferences.begin("ld2450-zones", false);
-    preferences.putBytes("polygons", detectionPolygons, sizeof(detectionPolygons));
-    preferences.putUChar("poly_count", polyCount);
-    preferences.putBytes("poly_masks", polygonMasks, sizeof(polygonMasks));
-    preferences.end();
+    Preferences p;
+    if (!p.begin("ld2450-zones", false)) {
+        Serial.println("[Zones] ERROR: polygon save failed to open NVS namespace");
+        return;
+    }
+    p.putBytes("polygons", detectionPolygons, sizeof(detectionPolygons));
+    p.putUChar("poly_count", polyCount);
+    p.putBytes("poly_masks", polygonMasks, sizeof(polygonMasks));
+    p.end();
 }
 
 static void loadPolygonsFn() {
@@ -183,11 +218,18 @@ void saveNoiseMapFn() {
 }
 
 // --- MQTT CALLBACK (alarm commands from HA) ---
-// Protokol HA MQTT Alarm Panel: payload může být buď čistý příkaz "DISARM",
-// nebo JSON `{"action":"DISARM","code":"1234"}` (když je v HA `code_disarm_required=true`).
-// Aby DISARM přes MQTT vyžadoval kód, kontrolujeme NVS klíč `sec_code`. Pokud je prázdný,
-// MQTT DISARM funguje bez kódu (uživatel kód nikdy nenastavil → backwards compat).
+// HA MQTT Alarm Panel protocol: the payload is either a plain command such as "DISARM",
+// or JSON `{"action":"DISARM","code":"1234"}` (when HA has `code_disarm_required=true`).
+// SEC-08: DISARM over MQTT ALWAYS requires a configured `sec_code`. If no code is
+// configured, remote DISARM is rejected (fail closed) - broker access alone
+// must not be enough to disarm the alarm. ARM commands need no code (not sensitive).
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
+#ifndef ENABLE_MQTT_ALARM_COMMANDS
+    // Remote MQTT alarm control (ARM/DISARM) is deactivated. We do not subscribe to
+    // the command topic either, so this should never fire — ignore defensively.
+    (void)topic; (void)payload; (void)length;
+    return;
+#else
     if (length == 0 || length > 256) return;
     char buf[257];
     memcpy(buf, payload, length);
@@ -217,16 +259,24 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         p.begin("ld2450_config", true);
         String requiredCode = p.getString("sec_code", "");
         p.end();
-        if (requiredCode.length() == 0 || requiredCode == code) {
+        if (requiredCode.length() == 0) {
+            // SEC-08: fail closed — no command secret configured, so refuse remote
+            // DISARM entirely. Broker access alone must not control the alarm.
+            Serial.println("[MQTT] DISARM rejected: no sec_code configured (set one to allow remote disarm)");
+            if (mqttService.connected()) {
+                mqttService.publish(mqttService.getTopics().notification,
+                    "DISARM rejected: no security code configured", false);
+            }
+        } else if (requiredCode == code) {
             securityMonitor.setArmed(false);
         } else {
             Serial.println("[MQTT] DISARM rejected: invalid/missing code");
-            // Volitelná notifikace
             if (mqttService.connected()) {
                 mqttService.publish(mqttService.getTopics().notification, "DISARM rejected: invalid code", false);
             }
         }
     }
+#endif // ENABLE_MQTT_ALARM_COMMANDS
 }
 
 // --- WIFI SETUP ---
@@ -234,44 +284,9 @@ bool shouldSaveConfig = false;
 void saveConfigCallback() { shouldSaveConfig = true; }
 
 void setupWiFi() {
-  #if LAB_MODE == 1
-    Serial.println("[WiFi] LAB MODE - Direct connection");
-    // Factory reset - require 3-second sustained press on BOOT button
-    pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
-    delay(200);
-    if (digitalRead(RESET_BUTTON_PIN) == LOW) {
-        Serial.println("[RESET] Button detected - hold 3s for factory reset...");
-        unsigned long pressStart = millis();
-        while (digitalRead(RESET_BUTTON_PIN) == LOW) {
-            if (millis() - pressStart >= 3000) {
-                Serial.println("[RESET] Factory reset triggered!");
-                preferences.clear();
-                delay(500);
-                safeRestart("factory_reset");
-            }
-            delay(50);
-        }
-        Serial.println("[RESET] Button released - continuing normal boot");
-    }
-
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID_DEFAULT, WIFI_PASS_DEFAULT);
-
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 40) {
-        delay(500); Serial.print("."); attempts++;
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\n[WiFi] Connected: " + WiFi.localIP().toString());
-    } else {
-        Serial.println("\n[WiFi] FAILED - continuing without network");
-        // Don't restart! Radar will work locally without WiFi.
-    }
-    return;
-  #endif
-
-  // PROD MODE
   AsyncWiFiManager* wm = new AsyncWiFiManager(&server, &dns);
+  Serial.println("[WiFi] Captive portal mode");
+
   // Factory reset - require 3-second sustained press on BOOT button
   pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
   delay(200);
@@ -291,6 +306,7 @@ void setupWiFi() {
       Serial.println("[RESET] Button released - continuing normal boot");
   }
 
+  // PROD MODE: captive portal for WiFi + MQTT parameters
   SystemConfig& cfg = configManager.getConfig();
 
   wm->setConfigPortalTimeout(300);
@@ -328,239 +344,12 @@ void setupWiFi() {
   delete wm;
 }
 
-// --- SETUP ---
-void setup() {
-  Serial.begin(115200);
-  delay(500);
-  Serial.println("\n\n=== ESP32 LD2450 SECURITY NODE " FW_VERSION " ===");
-  Serial.print("Reset Reason: ");
-  Serial.println(getResetReason());
-
-  // Show previous session info
-  {
-    Preferences p;
-    p.begin("ld2450_sys", true);
-    String prevReason = p.getString("rst_reason", "");
-    unsigned long prevUptime = p.getULong("rst_uptime", 0);
-    p.end();
-    if (prevReason.length() > 0) {
-      Serial.printf("[SYS] Previous restart: %s (uptime %lu s)\n", prevReason.c_str(), prevUptime);
-    }
-  }
-
-  // OTA Rollback — delayed validation in loop() after 60s stable operation
-  {
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    esp_ota_img_states_t ota_state;
-    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
-      if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
-        Serial.println("[OTA] New firmware pending validation (60s grace period)...");
-      }
-    }
-  }
-
-  // LittleFS
-  if (!LittleFS.begin(true)) {
-      Serial.println("[LittleFS] Mount Failed");
-  } else {
-      Serial.println("[LittleFS] Mounted");
-  }
-
-  pinMode(LED_PIN_DEFAULT, OUTPUT);
-  digitalWrite(LED_PIN_DEFAULT, LOW);
-
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
-  {
-    esp_task_wdt_config_t wdt_config = {
-        .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
-        .idle_core_mask = 0,
-        .trigger_panic = true,
-    };
-    // ESP-IDF 5.x initializes TWDT automatically — reconfigure it
-    if (esp_task_wdt_reconfigure(&wdt_config) != ESP_OK) {
-        esp_task_wdt_init(&wdt_config);
-    }
-  }
-#else
-  esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
-#endif
-  esp_task_wdt_add(NULL);
-
-  preferences.begin("ld2450_config", false);
-
-  // ConfigManager
-  configManager.begin();
-  SystemConfig& cfg = configManager.getConfig();
-
-  // Generate Device ID from MAC
-  uint8_t macAddr[6];
-  WiFi.macAddress(macAddr);
-  char macStr[18];
-  snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
-           macAddr[0], macAddr[1], macAddr[2], macAddr[3], macAddr[4], macAddr[5]);
-
-  // Defaults based on MAC
-  snprintf(device_id, sizeof(device_id), "mw1_%02X%02X", macAddr[4], macAddr[5]);
-  snprintf(device_hostname, sizeof(device_hostname), "esp32-ld2450-%02X%02X", macAddr[4], macAddr[5]);
-
-  // NVS hostname (only if no known_devices match)
-  bool knownDevice = false;
-  for (int i = 0; i < KNOWN_DEVICE_COUNT; i++) {
-      if (strcasecmp(KNOWN_DEVICES[i].mac, macStr) == 0) {
-          strncpy(device_id, KNOWN_DEVICES[i].id, sizeof(device_id) - 1);
-          strncpy(device_hostname, KNOWN_DEVICES[i].hostname, sizeof(device_hostname) - 1);
-          Serial.printf("[SETUP] Known device: %s\n", KNOWN_DEVICES[i].id);
-          knownDevice = true;
-          break;
-      }
-  }
-
-  if (!knownDevice) {
-      String savedHostname = preferences.getString("hostname", "");
-      if (savedHostname.length() > 0) {
-          strncpy(device_hostname, savedHostname.c_str(), sizeof(device_hostname) - 1);
-      }
-  }
-
-  Serial.printf("[SETUP] Device ID: %s, Hostname: %s\n", device_id, device_hostname);
-
-  // WiFi
-  setupWiFi();
-  bool wifiConnected = (WiFi.status() == WL_CONNECTED);
-  Serial.printf("[HEAP] After WiFi: %u\n", ESP.getFreeHeap());
-
-  if (wifiConnected) {
-    Serial.println("[WiFi] Connected");
-    MDNS.begin(device_hostname);
-    MDNS.addService("http", "tcp", 80);
-    Serial.printf("[mDNS] http://%s.local\n", device_hostname);
-
-    // NTP Time Sync
-    configTime(3600, 3600, "pool.ntp.org", "time.google.com");
-    Serial.println("[NTP] Time sync configured (GMT+1, DST)");
-
-    // MQTT
-    mqttService.begin(&preferences, device_id, &netQuality);
-    mqttService.setCallback(mqttCallback);
-  } else {
-    Serial.println("[WiFi] No connection - skipping mDNS, MQTT");
-  }
-
-  // Radar
-  if (!radar.begin(Serial2)) {
-    Serial.println("[RADAR] Failed to init serial!");
-  } else {
-    // Dedikovaný UART task na Core 1 (stejné jádro jako loop), priorita 2 (nad loop=1).
-    // Eliminuje UART overflow při dlouhých blokujících operacích v hlavní smyčce
-    // (MQTT TLS handshake, NVS write, mbedtls cert parse).
-    radar.startTask(4096, 2, 1);
-
-    // Push native region filter (cmd 0xC2) z NVS, pokud je aktivní.
-    // Filter se aplikuje hardwarově v modulu ještě před UART → cíle jsou
-    // odfiltrované dřív, než dorazí do parser-bufferu.
-    {
-        const SystemConfig& rfCfg = configManager.getConfig();
-        if (rfCfg.region_filter_mode != 0) {
-            LD2450Service::RegionFilter rf{};
-            rf.mode = rfCfg.region_filter_mode;
-            for (uint8_t z = 0; z < 3; z++) {
-                rf.x1[z] = rfCfg.region_filter_zones[z * 4 + 0];
-                rf.y1[z] = rfCfg.region_filter_zones[z * 4 + 1];
-                rf.x2[z] = rfCfg.region_filter_zones[z * 4 + 2];
-                rf.y2[z] = rfCfg.region_filter_zones[z * 4 + 3];
-            }
-            radar.setRegionFilter(rf);
-        }
-    }
-  }
-  Serial.printf("[HEAP] After Radar: %u\n", ESP.getFreeHeap());
-
-  // EventLog
-  eventLog.begin();
-
-  // SecurityMonitor
-  securityMonitor.begin(&mqttService, &eventLog, &preferences);
-  securityMonitor.setSirenPin(SIREN_PIN_DEFAULT);
-
-  // Restore armed state from NVS (with exit delay to prevent false trigger on boot)
-  if (preferences.getBool("sec_armed", false)) {
-      bool homeMode = preferences.getBool("sec_home", false);
-      securityMonitor.setArmed(true, false, homeMode);
-      Serial.printf("[SecMon] Armed state restored from NVS (%s, with exit delay)\n",
-                    homeMode ? "HOME" : "AWAY");
-  }
-  Serial.printf("[HEAP] After Security: %u\n", ESP.getFreeHeap());
-
-  // AppContext (DI Container)
-  appContext.preferences = &preferences;
-  appContext.config = &configManager;
-  appContext.mqtt = &mqttService;
-  appContext.radar = &radar;
-  appContext.security = &securityMonitor;
-  appContext.eventLog = &eventLog;
-  appContext.zoneConfig = &zoneConfig;
-  appContext.adaptiveConfig = &staticAdaptiveConfig;
-  appContext.noiseMap = noiseMap;
-  appContext.targetHistory = &targetHistory;
-  appContext.ghostTracker = &ghostTracker;
-  appContext.tamperState = &tamperState;
-  appContext.tripwire = &tripwire;
-  appContext.analytics = &targetAnalytics;
-  appContext.netQuality = &netQuality;
-  appContext.blackoutZones = blackoutZones;
-  appContext.blackoutZoneCount = &blackoutZoneCount;
-  appContext.polygons = detectionPolygons;
-  appContext.polyCount = &polyCount;
-  appContext.polygonMasks = polygonMasks;
-  appContext.blackoutMasks = blackoutMasks;
-  appContext.currentProfile = &currentProfile;
-  appContext.deviceId = device_id;
-  appContext.deviceHostname = device_hostname;
-  appContext.authUser = cfg.auth_user;
-  appContext.authPass = cfg.auth_pass;
-  appContext.useNoiseFilter = &useNoiseFilter;
-  appContext.saveBlackoutZones = saveBlackoutZonesFn;
-  appContext.savePolygons = savePolygonsFn;
-  appContext.saveNoiseMap = saveNoiseMapFn;
-  appContext.shouldReboot = &shouldReboot;
-
-  // Načti polygony z NVS (analogicky blackout zones)
-  loadPolygonsFn();
-  appContext.telegram = &telegramService;
-  appContext.bluetooth = &bluetoothService;
-  appContext.dataMutex = xSemaphoreCreateMutex();
-  if (!appContext.dataMutex) {
-      Serial.println("[SETUP] FATAL: dataMutex create failed");
-      delay(2000);
-      safeRestart("mutex_create_failed");
-  }
-
-  // WebService
-  webService.begin(&appContext, &server);
-  Serial.printf("[HEAP] After WebService: %u\n", ESP.getFreeHeap());
-
-  // BluetoothService
-  bluetoothService.begin(device_hostname, &configManager);
-  Serial.printf("[HEAP] After BLE: %u\n", ESP.getFreeHeap());
-
-  // TelegramService (requires WiFi + enough heap for SSL)
-  // SSL/TLS handshake needs ~40KB; with BLE active heap may be too tight
-  // If heap is sufficient now, start immediately; otherwise defer until BLE stops
-  if (wifiConnected && ESP.getFreeHeap() > 100000) {
-    telegramService.begin(&preferences);
-    telegramService.setRadarService(&radar);
-    telegramService.setSecurityMonitor(&securityMonitor);
-    telegramService.setRebootFlag(&shouldReboot);
-    Serial.printf("[HEAP] After Telegram: %u\n", ESP.getFreeHeap());
-  } else if (wifiConnected) {
-    Serial.printf("[Telegram] Deferred - heap %u, will start after BLE stops\n", ESP.getFreeHeap());
-    telegramDeferred = true;
-  }
-
-  // OTA Configuration (requires WiFi)
-  if (wifiConnected) {
+#ifdef ENABLE_ARDUINO_OTA
+// ArduinoOTA handler setup — extracted so it can be (re)installed on a WiFi
+// connect edge, not only at boot (NET-01). Disabled by default (SEC-02).
+static void setupArduinoOTA() {
     ArduinoOTA.setHostname(device_hostname);
-    ArduinoOTA.setPassword("admin");
+    ArduinoOTA.setPassword(ARDUINO_OTA_PASSWORD);
     ArduinoOTA.setPort(3232);
 
     ArduinoOTA.onStart([]() {
@@ -609,44 +398,406 @@ void setup() {
     });
 
     ArduinoOTA.begin();
-    Serial.println("[OTA] Ready - Hostname: " + String(device_hostname));
-  } else {
-    Serial.println("[OTA] Skipped - no WiFi");
+    Serial.println("[OTA] ArduinoOTA ready - Hostname: " + String(device_hostname));
+}
+#endif
+
+// NET-01: idempotent "WiFi is up" lifecycle handler. Runs on the first-boot
+// connect and again on every later reconnect edge, so a node that booted
+// offline still gets mDNS, NTP, MQTT and OTA once WiFi appears. The one-shot
+// bindings (MQTT client, ArduinoOTA listener) are guarded so a reconnect does
+// not re-allocate them; mDNS/NTP are cheap and simply refreshed.
+static void onWifiConnected(bool firstBoot) {
+    static bool s_mqttBegun = false;
+    static bool s_otaBegun  = false;
+
+    Serial.println("[NET] Bringing up network services");
+
+    // mDNS — refresh (safe to end+begin after an IP change).
+    MDNS.end();
+    if (MDNS.begin(device_hostname)) {
+        MDNS.addService("http", "tcp", 80);
+        Serial.printf("[mDNS] http://%s.local\n", device_hostname);
+    }
+
+    // NTP with configurable POSIX timezone (TIME-01).
+    {
+        const char* tz = configManager.getConfig().timezone;
+        if (!tz || !tz[0]) tz = "CET-1CEST,M3.5.0,M10.5.0/3";
+        configTzTime(tz, "pool.ntp.org", "time.google.com");
+        Serial.printf("[NTP] Time sync configured (TZ=%s)\n", tz);
+    }
+
+    // MQTT — begin once; it self-reconnects afterwards via update().
+    if (!s_mqttBegun) {
+        mqttService.begin(&preferences, device_id, &netQuality);
+        mqttService.setCallback(mqttCallback);
+        s_mqttBegun = true;
+    }
+
+#ifdef ENABLE_ARDUINO_OTA
+    if (!s_otaBegun) {
+        setupArduinoOTA();
+        s_otaBegun = true;
+    }
+#endif
+
+    // Telegram needs WiFi + heap; if it was not started at boot (e.g. booted
+    // offline), request the deferred start path used by the main loop.
+    if (!firstBoot && !telegramService.isEnabled()) {
+        telegramDeferred = true;
+    }
+}
+
+// --- SETUP ---
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n\n=== ESP32 LD2450 SECURITY NODE " FW_VERSION " ===");
+  Serial.print("Reset Reason: ");
+  Serial.println(getResetReason());
+
+  // Show previous session info
+  {
+    Preferences p;
+    p.begin("ld2450_sys", true);
+    String prevReason = p.getString("rst_reason", "");
+    unsigned long prevUptime = p.getULong("rst_uptime", 0);
+    p.end();
+    if (prevReason.length() > 0) {
+      Serial.printf("[SYS] Previous restart: %s (uptime %lu s)\n", prevReason.c_str(), prevUptime);
+    }
   }
+
+  // OTA Rollback — delayed validation in loop() after 60s stable operation
+  {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t ota_state;
+    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
+      if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+        Serial.println("[OTA] New firmware pending validation (60s grace period)...");
+      }
+    }
+  }
+
+  // LittleFS
+  // Never format blindly: a format erases logs, noise map and offline MQTT data.
+  {
+    Preferences fsPrefs;
+    fsPrefs.begin("fsstate", false);
+    bool everMounted = fsPrefs.getBool("ok", false);
+    uint8_t failedBoots = fsPrefs.getUChar("fails", 0);
+    bool mounted = LittleFS.begin(false);
+    if (!mounted) {
+      delay(200);
+      mounted = LittleFS.begin(false);  // one retry for a transient failure
+    }
+    if (!mounted) {
+      Serial.println("[LittleFS] Mount Failed");
+      if (ld2450_fs::mountFailAction(everMounted, failedBoots) == ld2450_fs::Format) {
+        Serial.println("[LittleFS] Formatting (fresh flash or repeated mount failures)");
+        mounted = LittleFS.begin(true);
+      } else {
+        if (failedBoots < 255) fsPrefs.putUChar("fails", failedBoots + 1);
+        Serial.println("[LittleFS] Running without filesystem; data kept for the next boot");
+      }
+    }
+    if (mounted) {
+      Serial.println("[LittleFS] Mounted");
+      if (!everMounted) fsPrefs.putBool("ok", true);
+      if (failedBoots) fsPrefs.putUChar("fails", 0);
+    }
+    fsPrefs.end();
+  }
+
+  pinMode(LED_PIN_DEFAULT, OUTPUT);
+  digitalWrite(LED_PIN_DEFAULT, LOW);
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
+  {
+    esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
+        .idle_core_mask = 0,
+        .trigger_panic = true,
+    };
+    // ESP-IDF 5.x initializes TWDT automatically — reconfigure it
+    if (esp_task_wdt_reconfigure(&wdt_config) != ESP_OK) {
+        esp_task_wdt_init(&wdt_config);
+    }
+  }
+#else
+  esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
+#endif
+  esp_task_wdt_add(NULL);
+
+  preferences.begin("ld2450_config", false);
+
+  // ConfigManager
+  configManager.begin();
+  SystemConfig& cfg = configManager.getConfig();
+
+  // CFG-02: load the complete persisted zone model into the runtime ZoneConfig
+  // (previously never loaded — zones reset to defaults on every reboot), with
+  // one-time migration from the legacy zone_* short keys.
+  ld2450_zones::load(preferences, zoneConfig);
+
+  // Generate Device ID from MAC
+  uint8_t macAddr[6];
+  WiFi.macAddress(macAddr);
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
+           macAddr[0], macAddr[1], macAddr[2], macAddr[3], macAddr[4], macAddr[5]);
+
+  // Defaults based on MAC
+  snprintf(device_id, sizeof(device_id), "mw1_%02X%02X", macAddr[4], macAddr[5]);
+  snprintf(device_hostname, sizeof(device_hostname), "esp32-ld2450-%02X%02X", macAddr[4], macAddr[5]);
+
+  // NVS hostname (only if no known_devices match)
+  bool knownDevice = false;
+  for (int i = 0; i < KNOWN_DEVICE_COUNT; i++) {
+      if (strcasecmp(KNOWN_DEVICES[i].mac, macStr) == 0) {
+          strncpy(device_id, KNOWN_DEVICES[i].id, sizeof(device_id) - 1);
+          strncpy(device_hostname, KNOWN_DEVICES[i].hostname, sizeof(device_hostname) - 1);
+          Serial.printf("[SETUP] Known device: %s\n", KNOWN_DEVICES[i].id);
+          knownDevice = true;
+          break;
+      }
+  }
+
+  if (!knownDevice) {
+      String savedHostname = preferences.getString("hostname", "");
+      if (savedHostname.length() > 0) {
+          strncpy(device_hostname, savedHostname.c_str(), sizeof(device_hostname) - 1);
+      }
+  }
+
+  Serial.printf("[SETUP] Device ID: %s, Hostname: %s\n", device_id, device_hostname);
+
+  // WiFi
+  setupWiFi();
+  bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+  Serial.printf("[HEAP] After WiFi: %u\n", ESP.getFreeHeap());
+
+  if (wifiConnected) {
+    Serial.println("[WiFi] Connected");
+    onWifiConnected(true);  // NET-01: mDNS + NTP + MQTT (+ OTA below)
+  } else {
+    Serial.println("[WiFi] No connection - services start on reconnect (NET-01)");
+  }
+
+  // Radar
+  if (!radar.begin(Serial2)) {
+    Serial.println("[RADAR] Failed to init serial!");
+  } else {
+    // Dedicated UART task on Core 1 (same core as loop), priority 2 (above loop=1).
+    // Prevents UART overflow during long blocking operations in the main loop
+    // (MQTT TLS handshake, NVS write, mbedtls cert parse).
+    radar.startTask(4096, 2, 1);
+
+    // Push the native region filter (cmd 0xC2) from NVS if active.
+    // The filter is applied in hardware inside the module before the UART, so targets are
+    // filtered out before they reach the parser buffer.
+    {
+        const SystemConfig& rfCfg = configManager.getConfig();
+        if (rfCfg.region_filter_mode != 0) {
+            LD2450Service::RegionFilter rf{};
+            rf.mode = rfCfg.region_filter_mode;
+            for (uint8_t z = 0; z < 3; z++) {
+                rf.x1[z] = rfCfg.region_filter_zones[z * 4 + 0];
+                rf.y1[z] = rfCfg.region_filter_zones[z * 4 + 1];
+                rf.x2[z] = rfCfg.region_filter_zones[z * 4 + 2];
+                rf.y2[z] = rfCfg.region_filter_zones[z * 4 + 3];
+            }
+            radar.setRegionFilter(rf);
+        }
+    }
+  }
+  Serial.printf("[HEAP] After Radar: %u\n", ESP.getFreeHeap());
+
+  // EventLog
+  eventLog.begin();
+
+  // SecurityMonitor
+  securityMonitor.begin(&mqttService, &eventLog, &preferences);
+  // DOC-03: siren GPIO is NVS-configurable but validated against a safe
+  // allowlist; an out-of-range/unsafe stored value falls back to disabled (-1).
+  {
+    int sirenPin = preferences.getInt("siren_pin", SIREN_PIN_DEFAULT);
+    if (!ld2450_gpio::sirenPinAllowed(sirenPin)) {
+      Serial.printf("[SIREN] Stored GPIO %d not in safe allowlist — disabling\n", sirenPin);
+      sirenPin = -1;
+    }
+    securityMonitor.setSirenPin((int8_t)sirenPin);
+  }
+
+  // Restore armed state from NVS (with exit delay to prevent false trigger on boot)
+  if (preferences.getBool("sec_armed", false)) {
+      bool homeMode = preferences.getBool("sec_home", false);
+      securityMonitor.setArmed(true, false, homeMode);
+      Serial.printf("[SecMon] Armed state restored from NVS (%s, with exit delay)\n",
+                    homeMode ? "HOME" : "AWAY");
+  }
+  Serial.printf("[HEAP] After Security: %u\n", ESP.getFreeHeap());
+
+  // AppContext (DI Container)
+  appContext.preferences = &preferences;
+  appContext.config = &configManager;
+  appContext.mqtt = &mqttService;
+  appContext.radar = &radar;
+  appContext.security = &securityMonitor;
+  appContext.eventLog = &eventLog;
+  appContext.zoneConfig = &zoneConfig;
+  appContext.adaptiveConfig = &staticAdaptiveConfig;
+  appContext.noiseMap = noiseMap;
+  appContext.targetHistory = &targetHistory;
+  appContext.ghostTracker = &ghostTracker;
+  appContext.tamperState = &tamperState;
+  appContext.tripwire = &tripwire;
+  appContext.analytics = &targetAnalytics;
+  appContext.netQuality = &netQuality;
+  appContext.blackoutZones = blackoutZones;
+  appContext.blackoutZoneCount = &blackoutZoneCount;
+  appContext.polygons = detectionPolygons;
+  appContext.polyCount = &polyCount;
+  appContext.polygonMasks = polygonMasks;
+  appContext.blackoutMasks = blackoutMasks;
+  appContext.currentProfile = &currentProfile;
+  appContext.deviceId = device_id;
+  appContext.deviceHostname = device_hostname;
+  appContext.authUser = cfg.auth_user;
+  appContext.authPass = cfg.auth_pass;
+  // SEC-03: warn (do not block) while web credentials are still the shipped default.
+  if (ld2450::isDefaultCreds(cfg.auth_user, cfg.auth_pass, WEB_ADMIN_USER_DEFAULT, WEB_ADMIN_PASS_DEFAULT)) {
+      Serial.println("[SECURITY] WARNING: default web credentials (admin/admin) in use — change them in the Network section.");
+  }
+  appContext.useNoiseFilter = &useNoiseFilter;
+  appContext.saveBlackoutZones = saveBlackoutZonesFn;
+  appContext.savePolygons = savePolygonsFn;
+  appContext.saveNoiseMap = saveNoiseMapFn;
+  appContext.shouldReboot = &shouldReboot;
+
+  // Load polygons from NVS (same as blackout zones)
+  loadPolygonsFn();
+  appContext.telegram = &telegramService;
+  appContext.bluetooth = &bluetoothService;
+  appContext.dataMutex = xSemaphoreCreateMutex();
+  if (!appContext.dataMutex) {
+      Serial.println("[SETUP] FATAL: dataMutex create failed");
+      delay(2000);
+      safeRestart("mutex_create_failed");
+  }
+
+  // WebService
+  webService.begin(&appContext, &server);
+  Serial.printf("[HEAP] After WebService: %u\n", ESP.getFreeHeap());
+
+  // BluetoothService
+  bluetoothService.begin(device_hostname, &configManager);
+  Serial.printf("[HEAP] After BLE: %u\n", ESP.getFreeHeap());
+
+  // TelegramService (requires WiFi + enough heap for SSL)
+  // SSL/TLS handshake needs ~40KB; with BLE active heap may be too tight
+  // If heap is sufficient now, start immediately; otherwise defer until BLE stops
+  if (wifiConnected && ESP.getFreeHeap() > 100000) {
+    telegramService.begin(&preferences);
+    telegramService.setRadarService(&radar);
+    telegramService.setSecurityMonitor(&securityMonitor);
+    telegramService.setRebootFlag(&shouldReboot);
+    Serial.printf("[HEAP] After Telegram: %u\n", ESP.getFreeHeap());
+  } else if (wifiConnected) {
+    Serial.printf("[Telegram] Deferred - heap %u, will start after BLE stops\n", ESP.getFreeHeap());
+    telegramDeferred = true;
+  }
+
+#ifdef ENABLE_ARDUINO_OTA
+  // OTA listener is installed by onWifiConnected() (NET-01) — at boot if WiFi is
+  // already up, otherwise on the first reconnect. Disabled by default (SEC-02).
+  if (!wifiConnected) Serial.println("[OTA] Deferred - starts on WiFi connect");
+#else
+  Serial.println("[OTA] ArduinoOTA disabled in this build (use Web OTA)");
+#endif
 
   // Presence Service (main processing loop)
   presenceService.begin(&appContext);
 
   Serial.printf("[SETUP] Free heap: %u bytes\n", ESP.getFreeHeap());
   Serial.println("=== SETUP COMPLETE ===\n");
+  _setupCompleteMs = millis(); // OTA-01: start the rollback-validation window here
 }
 
 // --- LOOP ---
 void loop() {
   esp_task_wdt_reset();
+#ifdef ENABLE_ARDUINO_OTA
   ArduinoOTA.handle();
+#endif
   presenceService.update();
   securityMonitor.update();
   bluetoothService.update();
 
   unsigned long now = millis();
 
+  // NET-01: edge-triggered WiFi lifecycle. Detect connect/disconnect edges and
+  // (re)initialize dependent services on connect; nudge a reconnect when down.
+  {
+    static bool wifiWas = (WiFi.status() == WL_CONNECTED);
+    static unsigned long lastReconnectTry = 0;
+    bool wifiNow = (WiFi.status() == WL_CONNECTED);
+    if (wifiNow && !wifiWas) {
+      Serial.println("[NET] WiFi reconnected");
+      onWifiConnected(false);
+    } else if (!wifiNow && wifiWas) {
+      Serial.println("[NET] WiFi lost — services will re-init on reconnect");
+    }
+    if (!wifiNow && (now - lastReconnectTry > 20000)) {
+      lastReconnectTry = now;
+      // WiFi.reconnect() pouziva jen POSLEDNI begin() (po selhani = zaloha) -> primarni
+      // sit by se po vypadku routeru nikdy neobnovila. Se zalohou strida obe site.
+      static bool s_tryBackup = false;
+      const SystemConfig& wc = configManager.getConfig();
+      const bool hasPrimary = true;  // primary credentials are stored by the captive portal
+      s_tryBackup = ld2450_wifi::nextIsBackup(s_tryBackup, hasPrimary, wc.backup_ssid[0] != '\0');
+      if (s_tryBackup) WiFi.begin(wc.backup_ssid, wc.backup_pass);
+      else if (wc.backup_ssid[0] && hasPrimary) {
+          WiFi.begin();  // re-use the portal-stored credentials
+      } else WiFi.reconnect();
+    }
+    wifiWas = wifiNow;
+  }
+
   // MQTT reconnect: force state re-publish
   if (mqttService.consumeReconnect()) {
       securityMonitor.forceRepublish();
   }
 
-  // P0-5: OTA delayed validation — wait 60s before marking firmware valid
-  if (!_otaValidated && now > TIMEOUT_OTA_VALIDATION_MS) {
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    esp_ota_img_states_t ota_state;
-    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
-      if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
-        esp_ota_mark_app_valid_cancel_rollback();
-        Serial.println("[OTA] Firmware validated after 60s stable operation");
+  // OTA-01: delayed rollback validation. The stability window is measured from the
+  // end of setup(). Health signal is intentionally NOT tied to WiFi — the node is
+  // designed to run offline (radar works without network), so requiring WiFi would
+  // roll back a perfectly healthy offline image. Surviving the window without a crash
+  // plus a non-starved heap is the health proof. Only mark validated on ESP_OK — if
+  // the NVS write fails we keep _otaValidated false and retry on a later loop.
+  if (!_otaValidated && _setupCompleteMs != 0 &&
+      (millis() - _setupCompleteMs) > TIMEOUT_OTA_VALIDATION_MS) {
+    bool healthy = (ESP.getFreeHeap() > HEAP_MIN_FOR_PUBLISH);
+    if (healthy) {
+      const esp_partition_t *running = esp_ota_get_running_partition();
+      esp_ota_img_states_t ota_state;
+      if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
+        if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+          esp_err_t markErr = esp_ota_mark_app_valid_cancel_rollback();
+          if (markErr == ESP_OK) {
+            Serial.println("[OTA] Firmware validated after stable operation");
+            _otaValidated = true;
+          } else {
+            Serial.printf("[OTA] mark_app_valid failed (%d) — will retry\n", markErr);
+          }
+        } else {
+          // Not pending verify (normal boot / already validated) — nothing to do.
+          _otaValidated = true;
+        }
       }
     }
-    _otaValidated = true;
+    // If not healthy yet, leave _otaValidated false and re-check next loop.
   }
 
   // P0-4: Uptime persistence — save every hour
@@ -658,23 +809,28 @@ void loop() {
     p.end();
   }
 
-  // Deferred Telegram init: start after BLE frees heap
+  // Deferred Telegram init: start after BLE frees heap; retried every 60 s until started
   if (telegramDeferred && !bluetoothService.isRunning()) {
-    telegramDeferred = false;
-    if (WiFi.status() == WL_CONNECTED && ESP.getFreeHeap() > 100000) {
-      telegramService.begin(&preferences);
-      telegramService.setRadarService(&radar);
-      telegramService.setSecurityMonitor(&securityMonitor);
-      telegramService.setRebootFlag(&shouldReboot);
-      Serial.printf("[Telegram] Deferred init OK - heap: %u\n", ESP.getFreeHeap());
-    } else {
-      Serial.printf("[Telegram] Deferred init failed - heap: %u\n", ESP.getFreeHeap());
+    static uint32_t lastTgTry = 0;
+    if (ld2450_sched::retryDue((uint32_t)now, lastTgTry, 60000)) {
+      lastTgTry = (uint32_t)now ? (uint32_t)now : 1;
+      if (WiFi.status() == WL_CONNECTED && ESP.getFreeHeap() > 100000) {
+        telegramDeferred = false;
+        telegramService.begin(&preferences);
+        telegramService.setRadarService(&radar);
+        telegramService.setSecurityMonitor(&securityMonitor);
+        telegramService.setRebootFlag(&shouldReboot);
+        Serial.printf("[Telegram] Deferred init OK - heap: %u\n", ESP.getFreeHeap());
+      } else {
+        Serial.printf("[Telegram] Deferred init postponed - heap: %u\n", ESP.getFreeHeap());
+      }
     }
   }
 
   // Scheduled arm/disarm (check every 30s)
   {
     static unsigned long lastSchedCheck = 0;
+    static int32_t lastArmMin = -1, lastDisMin = -1;  // last handled schedule minute
     if (now - lastSchedCheck > 30000) {
       lastSchedCheck = now;
       time_t epoch = time(nullptr);
@@ -684,13 +840,14 @@ void loop() {
         int cur = ti.tm_hour * 60 + ti.tm_min;
         const char* armT = configManager.getConfig().sched_arm_time;
         const char* disT = configManager.getConfig().sched_disarm_time;
-        int h, m;
-        if (strlen(armT) >= 4 && sscanf(armT, "%d:%d", &h, &m) == 2 && cur == h*60+m && !securityMonitor.isArmed()) {
+        int32_t minId = (int32_t)(epoch / 60);
+        // Act once per schedule edge: a manual override afterwards sticks until the next edge.
+        if (ld2450_sched::edgeOnce(ld2450_time::scheduleDue(cur, armT), minId, lastArmMin) && !securityMonitor.isArmed()) {
           securityMonitor.setArmed(true, false);
           Serial.printf("[SCHED] Auto-armed at %s\n", armT);
           if (telegramService.isEnabled()) telegramService.sendMessage("🔒 Scheduled arm (" + String(armT) + ")");
         }
-        if (strlen(disT) >= 4 && sscanf(disT, "%d:%d", &h, &m) == 2 && cur == h*60+m && securityMonitor.isArmed()) {
+        if (ld2450_sched::edgeOnce(ld2450_time::scheduleDue(cur, disT), minId, lastDisMin) && securityMonitor.isArmed()) {
           securityMonitor.setArmed(false);
           Serial.printf("[SCHED] Auto-disarmed at %s\n", disT);
           if (telegramService.isEnabled()) telegramService.sendMessage("🔓 Scheduled disarm (" + String(disT) + ")");
@@ -700,8 +857,8 @@ void loop() {
   }
 
   // Day/Night zone profile selector (check every 30s, shares time-since check with scheduled arm)
-  // Pokud night_start_time je prázdný, profil zůstává day. Jinak: porovnej HH:MM s aktuální dobou.
-  // Pokud start < end (např. 22:00 → 06:00 nestandardní), použiju logiku: noc = čas v intervalu nebo přes půlnoc.
+  // If night_start_time is empty, the profile stays day. Otherwise compare HH:MM with the current time.
+  // If start > end (e.g. 22:00 -> 06:00) the night interval wraps over midnight.
   {
     static unsigned long lastProfCheck = 0;
     if (now - lastProfCheck > 30000) {
@@ -709,17 +866,13 @@ void loop() {
       const char* nsT = configManager.getConfig().night_start_time;
       const char* neT = configManager.getConfig().night_end_time;
       uint8_t newProfile = 0x01; // default day
-      if (strlen(nsT) >= 4 && strlen(neT) >= 4) {
-        time_t epoch = time(nullptr);
-        if (epoch > 1700000000) {
-          struct tm ti; localtime_r(&epoch, &ti);
-          int cur = ti.tm_hour * 60 + ti.tm_min;
-          int sh, sm, eh, em;
-          if (sscanf(nsT, "%d:%d", &sh, &sm) == 2 && sscanf(neT, "%d:%d", &eh, &em) == 2) {
-            int s = sh*60+sm, e = eh*60+em;
-            bool isNight = (s < e) ? (cur >= s && cur < e) : (cur >= s || cur < e);
-            newProfile = isNight ? 0x02 : 0x01;
-          }
+      time_t epoch = time(nullptr);
+      if (epoch > 1700000000) {
+        struct tm ti; localtime_r(&epoch, &ti);
+        int cur = ti.tm_hour * 60 + ti.tm_min;
+        bool isNight = false;
+        if (ld2450_time::isNightNow(cur, nsT, neT, isNight)) {
+          newProfile = isNight ? 0x02 : 0x01;
         }
       }
       if (newProfile != currentProfile) {

@@ -32,10 +32,7 @@ void ConfigManager::load() {
     _config.led_enabled = _prefs.getBool("led_en", true);
     _config.startup_led_sec = _prefs.getUInt("led_start", 120);
 
-    // LD2450-specific zone config
-    _config.zone_x_min = _prefs.getShort("zone_xmin", -4000);
-    _config.zone_x_max = _prefs.getShort("zone_xmax", 4000);
-    _config.zone_y_max = _prefs.getShort("zone_ymax", 8000);
+    // Zone config lives in the unified z_* schema (ld2450_zones::load) (CFG-02).
 
     // Schedule
     loadPref("sched_arm", _config.sched_arm_time, sizeof(_config.sched_arm_time));
@@ -43,6 +40,7 @@ void ConfigManager::load() {
     _config.auto_arm_minutes = _prefs.getUShort("auto_arm_min", 0);
     loadPref("night_start", _config.night_start_time, sizeof(_config.night_start_time));
     loadPref("night_end", _config.night_end_time, sizeof(_config.night_end_time));
+    loadPref("timezone", _config.timezone, sizeof(_config.timezone));
 
     // Native LD2450 region filter (cmd 0xC2)
     _config.region_filter_mode = (uint8_t)_prefs.getUChar("rf_mode", 0);
@@ -51,7 +49,7 @@ void ConfigManager::load() {
                                      _config.region_filter_zones,
                                      sizeof(_config.region_filter_zones));
         if (got != sizeof(_config.region_filter_zones)) {
-            // Korupce / neúplný blob — vynuluj
+            // Corrupt / incomplete blob: reset
             memset(_config.region_filter_zones, 0, sizeof(_config.region_filter_zones));
         }
     }
@@ -85,15 +83,14 @@ void ConfigManager::save() {
     _prefs.putBool("led_en", _config.led_enabled);
     _prefs.putUInt("led_start", _config.startup_led_sec);
 
-    _prefs.putShort("zone_xmin", _config.zone_x_min);
-    _prefs.putShort("zone_xmax", _config.zone_x_max);
-    _prefs.putShort("zone_ymax", _config.zone_y_max);
+    // Zone bounds are persisted via the z_* schema (ld2450_zones) (CFG-02).
 
     _prefs.putString("sched_arm", _config.sched_arm_time);
     _prefs.putString("sched_disarm", _config.sched_disarm_time);
     _prefs.putUShort("auto_arm_min", _config.auto_arm_minutes);
     _prefs.putString("night_start", _config.night_start_time);
     _prefs.putString("night_end", _config.night_end_time);
+    _prefs.putString("timezone", _config.timezone);
 
     _prefs.putUChar("rf_mode", _config.region_filter_mode);
     _prefs.putBytes("rf_zones",

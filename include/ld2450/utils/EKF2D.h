@@ -1,6 +1,6 @@
 #pragma once
-#include <Arduino.h>
 #include <cmath>
+#include <cstring>
 
 /**
  * EKF2D - Lightweight 2D Extended Kalman Filter for target tracking
@@ -38,6 +38,7 @@ public:
      * @param nowMs current millis()
      */
     void update(float measX, float measY, unsigned long nowMs) {
+        if (!std::isfinite(measX) || !std::isfinite(measY)) return; // NaN would poison the state permanently
         if (!_initialized) {
             _x[0] = measX;
             _x[1] = measY;
@@ -83,7 +84,7 @@ public:
 
         // Invert 2x2 S matrix
         float det = S[0][0] * S[1][1] - S[0][1] * S[1][0];
-        if (fabsf(det) < 1e-10f) {
+        if (!(fabsf(det) >= 1e-10f)) { // also catches NaN/Inf det
             // Singular - reset to measurement with zero velocity
             _x[0] = measX;
             _x[1] = measY;
@@ -93,7 +94,7 @@ public:
             memset(_cov, 0, sizeof(_cov));
             _cov[0][0] = _cov[1][1] = 100.0f;
             _cov[2][2] = _cov[3][3] = 50.0f;
-            // Bez aktualizace _lastUpdateMs by příští dt byl nesmyslně velký → další divergence.
+            // Without updating _lastUpdateMs the next dt would be huge and diverge again.
             _lastUpdateMs = nowMs;
             return;
         }
